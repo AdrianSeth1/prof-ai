@@ -5,6 +5,7 @@ Run: python app.py  →  http://127.0.0.1:7860
 
 import shutil
 import threading
+import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -216,14 +217,14 @@ def _qa_handler(session) -> None:
         tts = _get_tts()
         if tts:
             tts.speak(answer)
-    except Exception as e:
-        print(f"[Q&A error] {e}", flush=True)
+    except Exception:
+        traceback.print_exc()
         tts = _get_tts()
         if tts:
             try:
                 tts.speak("Sorry, I could not answer that.")
             except Exception:
-                pass
+                traceback.print_exc()
     finally:
         resume_recording()
         session.set_mode(Mode.LECTURE)

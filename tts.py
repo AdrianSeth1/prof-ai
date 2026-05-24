@@ -30,6 +30,9 @@ class PiperTTS:
         """Synthesize text and play through the default output device. Blocking."""
         wav_io = io.BytesIO()
         with wave.open(wav_io, "wb") as wav_out:
+            wav_out.setnchannels(1)
+            wav_out.setsampwidth(2)  # 16-bit PCM
+            wav_out.setframerate(self._sample_rate)
             self._voice.synthesize(text, wav_out)
         wav_io.seek(0)
         with wave.open(wav_io, "rb") as wav_in:
