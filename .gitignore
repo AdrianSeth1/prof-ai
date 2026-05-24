@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+chroma_db/
+transcripts/
+lectures/
+docs/
+models/
+.gradio/
+sessions.json
+manifest.json
