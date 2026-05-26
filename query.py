@@ -26,7 +26,16 @@ TOP_K = 6
 SYSTEM_PROMPT = (
     "You are a research assistant helping a professor. Answer based on the provided "
     "course materials. If the materials don't contain the answer, say so plainly rather "
-    "than guessing. When you make a claim, mention which source file it came from. /no_think"
+    "than guessing. When you make a claim, mention which source file it came from."
+)
+
+SYSTEM_PROMPT_WITH_PUBMED = (
+    "You are a research assistant helping a professor. You have been given both the "
+    "professor's course materials and recent PubMed literature. "
+    "Cite sources inline using [Doc: <filename>] or [PubMed: <PMID>] format. "
+    "Distinguish clearly between content from the professor's materials and recent literature. "
+    "When literature contradicts or extends the course materials, note it explicitly. "
+    "If neither source answers the question, say so plainly rather than guessing."
 )
 
 
@@ -35,32 +44,77 @@ def embed(text: str) -> list[float]:
     return response["embedding"]
 
 
-def build_context(results: dict) -> tuple[str, list[str]]:
-    blocks, sources = [], []
+def build_context(results: dict) -> tuple[str, list[str], list[dict]]:
+    """Return (context_str, unique_sources, chunk_details).
+
+    chunk_details entries: {source_file, location, preview}
+    """
+    blocks, sources, details = [], [], []
     docs = results.get("documents", [[]])[0]
     metas = results.get("metadatas", [[]])[0]
 
     for doc, meta in zip(docs, metas):
         src = meta.get("source_file", "unknown")
         label_parts = [f"Source: {src}"]
+        location = ""
 
         if meta.get("file_type") == "lecture_audio" and "timestamp_seconds" in meta:
             ts = int(meta["timestamp_seconds"])
             mm, ss = divmod(ts, 60)
-            label_parts.append(f"@{mm:02d}:{ss:02d}")
+            location = f"@{mm:02d}:{ss:02d}"
+            label_parts.append(location)
         elif "page_or_slide" in meta:
             key = "slide" if meta.get("file_type") == "pptx" else "page"
-            label_parts.append(f"{key} {meta['page_or_slide']}")
+            location = f"{key} {meta['page_or_slide']}"
+            label_parts.append(location)
 
         blocks.append(f"[{' | '.join(label_parts)}]\n{doc}")
         if src not in sources:
             sources.append(src)
+        details.append({
+            "source_file": src,
+            "location": location,
+            "preview": doc[:150] + ("…" if len(doc) > 150 else ""),
+        })
 
-    return "\n\n---\n\n".join(blocks), sources
+    return "\n\n---\n\n".join(blocks), sources, details
 
 
-def query_stream(question: str, session_id: str | None = None) -> Iterator[str | dict]:
-    """Yield LLM response tokens, then finally yield {"sources": [list]}.
+def build_pubmed_context(articles: list[dict]) -> str:
+    blocks = []
+    for a in articles:
+        author_str = ", ".join(a["authors"][:5])
+        if len(a["authors"]) > 5:
+            author_str += " et al."
+        blocks.append(
+            f"[PubMed: {a['pmid']}] {a['title']} ({a['journal']}, {a['pub_date']})\n"
+            f"Authors: {author_str}\n"
+            f"Abstract: {a['abstract']}"
+        )
+    return "\n\n".join(blocks)
+
+
+def _build_where(
+    session_id: str | None,
+    doc_ids: list[str] | None,
+) -> dict | None:
+    clauses = []
+    if session_id:
+        clauses.append({"session_id": {"$eq": session_id}})
+    if doc_ids:
+        clauses.append({"source_file": {"$in": doc_ids}})
+    if not clauses:
+        return None
+    return clauses[0] if len(clauses) == 1 else {"$and": clauses}
+
+
+def query_stream(
+    question: str,
+    session_id: str | None = None,
+    doc_ids: list[str] | None = None,
+    pubmed_results: list[dict] | None = None,
+) -> Iterator[str | dict]:
+    """Yield LLM response tokens, then finally yield {"sources": [...], "pubmed": [...]}.
 
     Raises ValueError if the collection is unavailable.
     """
@@ -79,18 +133,33 @@ def query_stream(question: str, session_id: str | None = None) -> Iterator[str |
         "n_results": min(TOP_K, collection.count()),
         "include": ["documents", "metadatas"],
     }
-    if session_id:
-        query_kwargs["where"] = {"session_id": {"$eq": session_id}}
+    where = _build_where(session_id, doc_ids)
+    if where:
+        query_kwargs["where"] = where
 
     results = collection.query(**query_kwargs)
-    context, sources = build_context(results)
+    local_context, sources, source_details = build_context(results)
+
+    if pubmed_results:
+        pubmed_context = build_pubmed_context(pubmed_results)
+        combined_context = (
+            "=== LOCAL DOCUMENT CONTEXT ===\n\n"
+            + local_context
+            + "\n\n=== RECENT LITERATURE (PubMed) ===\n\n"
+            + pubmed_context
+        )
+        system = SYSTEM_PROMPT_WITH_PUBMED
+    else:
+        combined_context = local_context
+        system = SYSTEM_PROMPT
+
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"Course material excerpts:\n\n{context}\n\nQuestion: {question}"},
+        {"role": "system", "content": system},
+        {"role": "user", "content": f"Context:\n\n{combined_context}\n\nQuestion: {question}"},
     ]
     for chunk in ollama.chat(model=LLM_MODEL, messages=messages, stream=True):
         yield chunk["message"]["content"]
-    yield {"sources": sources}
+    yield {"sources": sources, "source_details": source_details, "pubmed": pubmed_results or []}
 
 
 def resolve_session(args: argparse.Namespace) -> str | None:

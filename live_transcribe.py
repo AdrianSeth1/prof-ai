@@ -80,18 +80,23 @@ def _handle_question_utterance(
     model: WhisperModel,
     session: LectureSession,
 ) -> None:
+    print("[Q] utterance received, transcribing...", flush=True)
     text, confidence = transcribe_audio(model, audio)
+    print(f"[Q] transcribed: {text!r} (confidence {confidence:.2f})", flush=True)
     if not text or len(text.split()) < MIN_WORDS or confidence < MIN_AVG_LOGPROB:
-        # Nothing usable — go back to lecture silently
+        print("[Q] below threshold — returning to LECTURE", flush=True)
         session.set_mode(Mode.LECTURE)
         return
 
     session.pending_question = text
     session.set_mode(Mode.PROCESSING)
-    print(f"[Q] {text}", flush=True)
 
     if session._qa_handler:
+        print("[Q] firing _qa_handler thread", flush=True)
         threading.Thread(target=session._qa_handler, args=(session,), daemon=True).start()
+    else:
+        print("[Q] no _qa_handler registered!", flush=True)
+        session.set_mode(Mode.LECTURE)
 
 
 # ---------------------------------------------------------------------------

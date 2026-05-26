@@ -21,6 +21,7 @@ from live_transcribe import (
     pause_recording, resume_recording,
 )
 from manifest import load_manifest, save_manifest
+from pubmed import search_pubmed
 from qa import answer_question
 from query import query_stream
 from session import Mode
@@ -75,8 +76,9 @@ def _get_tts() -> PiperTTS | None:
     if _tts is None:
         try:
             _tts = PiperTTS()
-        except Exception as e:
-            print(f"[TTS] Not available: {e}", flush=True)
+        except Exception:
+            print("[TTS] Failed to load — voice disabled:", flush=True)
+            traceback.print_exc()
             _tts_available = False
             return None
     return _tts
@@ -167,23 +169,90 @@ def refresh_gaps_tab():
 
 
 # ---------------------------------------------------------------------------
+# Tab 1 — Chat helpers
+# ---------------------------------------------------------------------------
+
+def _format_docs_md(details: list[dict]) -> str:
+    if not details:
+        return "*No local documents retrieved.*"
+    by_file: dict[str, list[dict]] = {}
+    for d in details:
+        by_file.setdefault(d["source_file"], []).append(d)
+    lines = []
+    for src, chunks in by_file.items():
+        lines.append(f"**{src}**")
+        for c in chunks:
+            loc = f"`{c['location']}` " if c["location"] else ""
+            lines.append(f"- {loc}{c['preview']}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _format_pubmed_html(articles: list[dict]) -> str:
+    if not articles:
+        return (
+            "<p style='color:#6b7280; font-style:italic;'>"
+            "Enable the PubMed toggle and ask a question to see recent literature."
+            "</p>"
+        )
+    cards = []
+    for a in articles:
+        author_str = ", ".join(a["authors"][:3])
+        if len(a["authors"]) > 3:
+            author_str += " et al."
+        cards.append(
+            f"<div style='border:1px solid #d1d5db; border-radius:8px; padding:14px;"
+            f" margin:8px 0; background:#f9fafb;'>"
+            f"<a href='{a['url']}' target='_blank' rel='noopener noreferrer'"
+            f" style='font-weight:600; font-size:0.95em; color:#1d4ed8;"
+            f" text-decoration:none;'>{a['title']}</a>"
+            f"<div style='margin-top:6px; font-size:0.85em; color:#4b5563;'>"
+            f"<strong>{a['journal']}</strong> &bull; {a['pub_date']} &bull; "
+            f"<a href='{a['url']}' target='_blank' rel='noopener noreferrer'"
+            f" style='color:#6b7280;'>PMID {a['pmid']}</a></div>"
+            f"<div style='margin-top:4px; font-size:0.82em; color:#6b7280;'>"
+            f"{author_str}</div>"
+            f"</div>"
+        )
+    return "".join(cards)
+
+
+# ---------------------------------------------------------------------------
 # Tab 1 — Chat
 # ---------------------------------------------------------------------------
 
-def chat_fn(message: str, history: list, scope: str):
+def chat_fn(
+    message: str,
+    history: list,
+    scope: str,
+    doc_filter: list[str],
+    pubmed_on: bool,
+    pubmed_max: int,
+):
     session_id = scope_to_session_id(scope)
-    partial, sources = "", []
+    partial, source_details, pubmed_articles = "", [], []
+
+    pubmed_results = None
+    if pubmed_on:
+        pubmed_results = search_pubmed(message, max_results=int(pubmed_max))
+
     try:
-        for token in query_stream(message, session_id):
+        for token in query_stream(
+            message, session_id,
+            doc_ids=doc_filter or None,
+            pubmed_results=pubmed_results,
+        ):
             if isinstance(token, dict):
-                sources = token.get("sources", [])
+                source_details = token.get("source_details", [])
+                pubmed_articles = token.get("pubmed", [])
             else:
                 partial += token
-                yield partial, ""
+                yield partial, "", ""
     except Exception as e:
-        yield f"⚠ {e}", ""
+        yield f"⚠ {e}", "", ""
         return
-    yield partial, "Sources:\n" + "\n".join(f"• {s}" for s in sources)
+
+    yield partial, _format_docs_md(source_details), _format_pubmed_html(pubmed_articles)
 
 
 # ---------------------------------------------------------------------------
@@ -208,15 +277,22 @@ def poll_live_gap() -> tuple[str, str]:
 def _qa_handler(session) -> None:
     """Full Q&A cycle: RAG → answer → TTS. Runs in a daemon thread."""
     question = session.pending_question
+    print(f"[Q&A] handler started, question: {question!r}", flush=True)
     try:
         _set_status("Thinking...")
         pause_recording()
+        print("[Q&A] mic paused, calling answer_question()", flush=True)
         answer = answer_question(question, session.linked_documents)
+        print(f"[Q&A] got answer ({len(answer)} chars)", flush=True)
         session.add_qa_entry(question, answer)
         _set_status("Speaking...")
         tts = _get_tts()
         if tts:
+            print("[Q&A] calling tts.speak()", flush=True)
             tts.speak(answer)
+            print("[Q&A] tts.speak() returned", flush=True)
+        else:
+            print("[Q&A] TTS unavailable — answer not spoken", flush=True)
     except Exception:
         traceback.print_exc()
         tts = _get_tts()
@@ -229,6 +305,7 @@ def _qa_handler(session) -> None:
         resume_recording()
         session.set_mode(Mode.LECTURE)
         _set_status("● Recording lecture")
+        print("[Q&A] handler done, mode → LECTURE", flush=True)
 
 
 def start_recording(device_str: str | None, lecture_name: str, linked_docs: list[str]):
@@ -299,13 +376,18 @@ def poll_qa_log() -> str:
 
 
 def ask_ai_fn() -> str:
+    print("[ASK AI] button clicked", flush=True)
     session = get_current_session()
     if session is None:
+        print("[ASK AI] no active session", flush=True)
         return "Not recording."
+    print(f"[ASK AI] current mode: {session.current_mode()}", flush=True)
     if session.current_mode() != Mode.LECTURE:
+        print("[ASK AI] not in LECTURE mode — ignoring", flush=True)
         return _get_status()
     session.set_mode(Mode.AWAITING_QUESTION)
     _set_status("Listening for question...")
+    print("[ASK AI] mode → AWAITING_QUESTION", flush=True)
     return "Listening for question..."
 
 
@@ -391,12 +473,53 @@ def build_ui() -> gr.Blocks:
     with gr.Blocks(title="Prof AI") as demo:
 
         # ── Tab 1: Chat ──────────────────────────────────────────────────
-        with gr.Tab("Chat"):
-            sources_box = gr.Textbox(label="Sources consulted", interactive=False, lines=2)
-            scope_dd = gr.Dropdown(choices=scope_choices(), value="All material",
-                                   label="Scope queries to", scale=1)
-            gr.ChatInterface(fn=chat_fn, additional_inputs=[scope_dd],
-                             additional_outputs=[sources_box], autoscroll=True)
+        with gr.Tab("Chat") as chat_tab:
+            # Declare output components with render=False so they can be
+            # passed to ChatInterface but rendered below it in the layout.
+            docs_md = gr.Markdown(
+                "*Ask a question to see document sources.*", render=False
+            )
+            pubmed_html = gr.HTML(
+                "<p style='color:#6b7280; font-style:italic;'>"
+                "Enable the PubMed toggle to include recent literature.</p>",
+                render=False,
+            )
+
+            with gr.Row():
+                scope_dd = gr.Dropdown(choices=scope_choices(), value="All material",
+                                       label="Scope queries to", scale=1)
+                doc_filter_dd = gr.Dropdown(
+                    choices=doc_dropdown_choices(), multiselect=True,
+                    label="Search in (leave empty for all)", scale=3,
+                )
+            with gr.Row():
+                pubmed_toggle = gr.Checkbox(
+                    label="Include recent literature (PubMed)", value=False, scale=2,
+                )
+                pubmed_max_num = gr.Number(
+                    value=5, minimum=1, maximum=10, precision=0,
+                    label="Max papers to include", scale=0, min_width=180,
+                )
+
+            gr.ChatInterface(
+                fn=chat_fn,
+                additional_inputs=[scope_dd, doc_filter_dd, pubmed_toggle, pubmed_max_num],
+                additional_outputs=[docs_md, pubmed_html],
+                autoscroll=True,
+            )
+
+            # Sources accordion — rendered here so it appears below the chat
+            with gr.Accordion("Sources", open=False):
+                with gr.Tabs():
+                    with gr.Tab("Documents"):
+                        docs_md.render()
+                    with gr.Tab("Recent Literature"):
+                        pubmed_html.render()
+
+            chat_tab.select(
+                fn=lambda: gr.update(choices=doc_dropdown_choices()),
+                outputs=[doc_filter_dd],
+            )
 
         # ── Tab 2: Live Lecture ──────────────────────────────────────────
         with gr.Tab("Live Lecture"):

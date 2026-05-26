@@ -12,7 +12,7 @@ import numpy as np
 import sounddevice as sd
 from piper.voice import PiperVoice
 
-MODELS_DIR = Path("models") / "piper"
+MODELS_DIR = Path(__file__).parent / "models" / "piper"
 DEFAULT_MODEL = "en_US-lessac-medium.onnx"
 
 
