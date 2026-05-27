@@ -82,9 +82,22 @@ def _load_transcript(session) -> str:
     return ""
 
 
+def _format_qa_history(session, max_turns: int = 2) -> str:
+    """Return the last N Q&A turns as a formatted block, or empty string."""
+    if session is None or not session.qa_history:
+        return ""
+    recent = session.qa_history[-max_turns:]
+    lines = []
+    for entry in recent:
+        lines.append(f'Q: {entry["question"]}')
+        lines.append(f'A: {entry["answer"]}')
+    return "\n".join(lines)
+
+
 def answer_question(question: str, linked_docs: list[str], session=None) -> tuple[str, list[str]]:
     """Return (answer, source_files) using the full transcript and linked doc chunks."""
     transcript_text = _load_transcript(session)
+    qa_history_text = _format_qa_history(session)
 
     if linked_docs:
         doc_context, source_files = _retrieve_chunks(question, linked_docs)
@@ -92,9 +105,14 @@ def answer_question(question: str, linked_docs: list[str], session=None) -> tupl
         doc_context, source_files = "", []
 
     print(
-        f"[Q&A] context sizes — doc:{len(doc_context)} transcript:{len(transcript_text)}",
+        f"[Q&A] context sizes — doc:{len(doc_context)} transcript:{len(transcript_text)} history:{len(qa_history_text)}",
         flush=True,
     )
+
+    history_block = f"""
+RECENT Q&A (this conversation so far):
+{qa_history_text}
+""" if qa_history_text else ""
 
     if linked_docs and doc_context:
         prompt = f"""/think You are a teaching assistant helping a professor during a live lecture.
@@ -104,14 +122,14 @@ LECTURE TRANSCRIPT (what was actually said so far):
 
 SOURCE MATERIAL (planned content from slides/notes):
 {doc_context}
-
+{history_block}
 The professor just asked: "{question}"
 
-If the question asks about what was missed, covered, forgotten, or still left to discuss, identify specific topics, concepts, or examples that appear in the SOURCE MATERIAL but NOT in the LECTURE TRANSCRIPT. Be specific. Reference the source material by name.
+If this is a follow-up to something in the recent Q&A above (e.g. "tell me more about X" or "expand on that"), go deeper on that specific idea using the source material.
 
-If the question is something else, answer using both the transcript and source material as context.
+If the question asks about what was missed, covered, forgotten, or still left to discuss, identify specific topics, concepts, or examples that appear in the SOURCE MATERIAL but NOT in the LECTURE TRANSCRIPT.
 
-Keep responses concise (will be spoken via TTS) but specific and actionable."""
+Respond conversationally, as if you're a knowledgeable colleague speaking aloud — not reading a list. Group related ideas into a theme or two, give a sentence of context for why each matters, and close with a clear takeaway. Be warm, curious, and direct. No bullet points, no headers, no colons introducing lists. Two to four sentences total."""
     else:
         prompt = f"""/think You are a teaching assistant helping a professor during a live lecture.
 
@@ -119,10 +137,12 @@ No source material is linked to this lecture session. Answer based only on the t
 
 LECTURE TRANSCRIPT (what was actually said so far):
 {transcript_text if transcript_text else "(no transcript yet)"}
-
+{history_block}
 The professor just asked: "{question}"
 
-Keep responses concise (will be spoken via TTS) but specific and actionable."""
+If this is a follow-up to something in the recent Q&A above (e.g. "tell me more about X"), go deeper on that specific idea.
+
+Respond conversationally, as if you're a knowledgeable colleague speaking aloud — not reading a list. Be warm, curious, and direct. No bullet points, no headers, no colons introducing lists. Two to four sentences total."""
 
     response = ollama.chat(
         model=LLM_MODEL,
