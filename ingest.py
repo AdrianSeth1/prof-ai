@@ -141,6 +141,7 @@ def ingest_file(path: Path, collection: chromadb.Collection, manifest: dict) -> 
                 "source_file": path.name,
                 "chunk_index": chunk_index,
                 "file_type": suffix.lstrip("."),
+                "content_type": "source_document",
             }
             # page_or_slide is meaningful for PDF and PPTX
             if section["page"] is not None:

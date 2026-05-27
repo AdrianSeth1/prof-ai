@@ -10,13 +10,27 @@ import threading
 import time
 
 import numpy as np
+
+# On Windows, ctranslate2 uses LoadLibrary which ignores add_dll_directory.
+# Prepend nvidia wheel DLL paths to PATH before the model loads.
+import os as _os, sys as _sys
+_nvidia_dirs = [
+    _os.path.join(_p, "nvidia", _sub, "bin")
+    for _p in _sys.path
+    for _sub in ("cublas", "cudnn")
+    if _os.path.isdir(_os.path.join(_p, "nvidia", _sub, "bin"))
+]
+if _nvidia_dirs:
+    _os.environ["PATH"] = _os.pathsep.join(_nvidia_dirs) + _os.pathsep + _os.environ.get("PATH", "")
+del _nvidia_dirs
+
 from faster_whisper import WhisperModel
 
 from recorder import SAMPLE_RATE, AudioRecorder
 from session import LectureSession, Mode
 
-WHISPER_MODEL = "small"
-MIN_WORDS = 3
+WHISPER_MODEL = "medium"
+MIN_WORDS = 2
 MIN_AVG_LOGPROB = -1.0
 
 # ---------------------------------------------------------------------------
@@ -38,12 +52,20 @@ _session_start: float = 0.0
 def _get_model() -> WhisperModel:
     global _whisper_model
     if _whisper_model is None:
+        print(f"[Whisper] loading model={WHISPER_MODEL!r} device=cuda compute_type=float16", flush=True)
         _whisper_model = WhisperModel(WHISPER_MODEL, device="cuda", compute_type="float16")
+        print(f"[Whisper] {WHISPER_MODEL!r} ready", flush=True)
     return _whisper_model
 
 
 def transcribe_audio(model: WhisperModel, audio: np.ndarray) -> tuple[str, float]:
-    segments_gen, _ = model.transcribe(audio, language="en", beam_size=5)
+    segments_gen, _ = model.transcribe(
+        audio,
+        language="en",
+        beam_size=5,
+        no_speech_threshold=0.6,
+        condition_on_previous_text=False,
+    )
     texts, logprobs = [], []
     for seg in segments_gen:
         t = seg.text.strip()
@@ -83,8 +105,15 @@ def _handle_question_utterance(
     print("[Q] utterance received, transcribing...", flush=True)
     text, confidence = transcribe_audio(model, audio)
     print(f"[Q] transcribed: {text!r} (confidence {confidence:.2f})", flush=True)
-    if not text or len(text.split()) < MIN_WORDS or confidence < MIN_AVG_LOGPROB:
-        print("[Q] below threshold — returning to LECTURE", flush=True)
+    reasons = []
+    if not text:
+        reasons.append("empty")
+    if text and len(text.split()) < MIN_WORDS:
+        reasons.append(f"too short ({len(text.split())} words < {MIN_WORDS})")
+    if confidence < MIN_AVG_LOGPROB:
+        reasons.append(f"low confidence ({confidence:.2f} < {MIN_AVG_LOGPROB})")
+    if reasons:
+        print(f"[Q] below threshold — {', '.join(reasons)} — returning to LECTURE", flush=True)
         session.set_mode(Mode.LECTURE)
         return
 
@@ -196,7 +225,7 @@ def main() -> None:
     parser.add_argument("--device", type=int, default=None, help="Input device index")
     args = parser.parse_args()
 
-    print("Loading Whisper small (CUDA float16)…")
+    print(f"Loading Whisper {WHISPER_MODEL!r} (CUDA float16)…")
     _get_model()  # pre-load so first utterance isn't slow
 
     session = start_live_session(device=args.device)

@@ -5,7 +5,9 @@ Run: python app.py  →  http://127.0.0.1:7860
 
 import shutil
 import threading
+import time
 import traceback
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -21,7 +23,11 @@ from live_transcribe import (
     pause_recording, resume_recording,
 )
 from manifest import load_manifest, save_manifest
-from pubmed import search_pubmed
+from modules import (
+    load_modules, save_modules, create_module, rename_module,
+    delete_module, expand_selection,
+)
+from pubmed import search_pubmed, reformulate_for_pubmed
 from qa import answer_question
 from query import query_stream
 from session import Mode
@@ -30,6 +36,7 @@ from tts import PiperTTS
 SESSIONS_MANIFEST = Path("sessions.json")
 DOC_MANIFEST = Path("manifest.json")
 LECTURES_DIR = Path("lectures")
+QA_AUDIO_DIR = Path("transcripts") / "qa_audio"
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".flac"}
 DOC_EXTS = {".pdf", ".docx", ".pptx"}
 
@@ -85,6 +92,57 @@ def _get_tts() -> PiperTTS | None:
 
 
 # ---------------------------------------------------------------------------
+# Q&A audio — written by background thread, polled by UI timer
+# ---------------------------------------------------------------------------
+
+_qa_audio_path: str | None = None
+_qa_audio_lock = threading.Lock()
+
+
+def _init_qa_audio_dir() -> None:
+    QA_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    cutoff = time.time() - 3600
+    for f in QA_AUDIO_DIR.glob("*.wav"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+        except OSError:
+            pass
+
+
+def _save_qa_audio(wav_bytes: bytes) -> str:
+    QA_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    path = QA_AUDIO_DIR / f"{uuid.uuid4().hex}.wav"
+    path.write_bytes(wav_bytes)
+    return str(path)
+
+
+def _set_qa_audio(path: str | None) -> None:
+    global _qa_audio_path
+    with _qa_audio_lock:
+        _qa_audio_path = path
+
+
+def _get_and_clear_qa_audio() -> str | None:
+    global _qa_audio_path
+    with _qa_audio_lock:
+        path = _qa_audio_path
+        _qa_audio_path = None
+    return path
+
+
+def _resume_after_playback(session) -> None:
+    """Called by threading.Timer after estimated audio duration elapses."""
+    if session and session.current_mode() == Mode.PROCESSING:
+        resume_recording()
+        session.set_mode(Mode.LECTURE)
+        _set_status("● Recording lecture")
+        print("[Q&A] mic resumed after estimated playback duration", flush=True)
+    else:
+        print("[Q&A] playback timer fired — mode already changed, skipping", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
 
@@ -116,6 +174,113 @@ def parse_device(s: str | None) -> int | None:
 
 def doc_dropdown_choices() -> list[str]:
     return sorted({Path(k).name for k in load_manifest(DOC_MANIFEST) if Path(k).suffix.lower() in DOC_EXTS})
+
+
+def unified_source_choices() -> list[tuple[str, str]]:
+    """Modules first (prefixed '[Module]'), then individual filenames. Used in Chat and Live Lecture."""
+    choices: list[tuple[str, str]] = [
+        (f"[Module] {m['name']}", m["id"]) for m in load_modules()
+    ]
+    choices += [(f, f) for f in doc_dropdown_choices()]
+    return choices
+
+
+def module_dd_choices() -> list[tuple[str, str]]:
+    """Choices for the Modules tab module selector (name + doc count)."""
+    return [(f"{m['name']} ({len(m['documents'])} docs)", m["id"]) for m in load_modules()]
+
+
+# ---------------------------------------------------------------------------
+# Modules tab event handlers
+# ---------------------------------------------------------------------------
+
+def create_module_fn(name: str):
+    if not name.strip():
+        return gr.update(), gr.update(), gr.update(), "", "Enter a module name."
+    mod = create_module(name.strip())
+    mod_choices = module_dd_choices()
+    src_choices = unified_source_choices()
+    return (
+        gr.update(choices=mod_choices, value=mod["id"]),
+        gr.update(choices=src_choices),
+        gr.update(choices=src_choices),
+        "",
+        f"Created '{mod['name']}'.",
+    )
+
+
+def rename_module_fn(mod_id: str | None, new_name: str):
+    if not mod_id:
+        return gr.update(), gr.update(), gr.update(), "No module selected."
+    if not new_name.strip():
+        return gr.update(), gr.update(), gr.update(), "Enter a new name."
+    rename_module(mod_id, new_name.strip())
+    mod_choices = module_dd_choices()
+    src_choices = unified_source_choices()
+    return (
+        gr.update(choices=mod_choices, value=mod_id),
+        gr.update(choices=src_choices),
+        gr.update(choices=src_choices),
+        f"Renamed to '{new_name.strip()}'.",
+    )
+
+
+def delete_module_stage1(mod_id: str | None):
+    if not mod_id:
+        return gr.update(interactive=False), "No module selected."
+    mods_by_id = {m["id"]: m for m in load_modules()}
+    name = mods_by_id.get(mod_id, {}).get("name", mod_id)
+    return gr.update(interactive=True), f"⚠ Click 'Confirm Delete' to remove '{name}'."
+
+
+def delete_module_stage2(mod_id: str | None):
+    if not mod_id:
+        return gr.update(), gr.update(), gr.update(), gr.update(interactive=False), "No module selected."
+    mods_by_id = {m["id"]: m for m in load_modules()}
+    name = mods_by_id.get(mod_id, {}).get("name", mod_id)
+    delete_module(mod_id)
+    mod_choices = module_dd_choices()
+    src_choices = unified_source_choices()
+    new_val = mod_choices[0][1] if mod_choices else None
+    return (
+        gr.update(choices=mod_choices, value=new_val),
+        gr.update(choices=src_choices),
+        gr.update(choices=src_choices),
+        gr.update(interactive=False),
+        f"Deleted '{name}'.",
+    )
+
+
+def load_module_docs_fn(mod_id: str | None):
+    if not mod_id:
+        return gr.update(value=[])
+    mods_by_id = {m["id"]: m for m in load_modules()}
+    mod = mods_by_id.get(mod_id, {})
+    return gr.update(value=mod.get("documents", []))
+
+
+def save_module_docs_fn(mod_id: str | None, selected: list[str]):
+    if not mod_id:
+        return gr.update(), gr.update(), gr.update(), "No module selected."
+    mods = load_modules()
+    for mod in mods:
+        if mod["id"] == mod_id:
+            mod["documents"] = selected or []
+            save_modules(mods)
+            mod_choices = module_dd_choices()
+            src_choices = unified_source_choices()
+            return (
+                gr.update(choices=mod_choices, value=mod_id),
+                gr.update(choices=src_choices),
+                gr.update(choices=src_choices),
+                f"Saved {len(selected or [])} doc(s) to '{mod['name']}'.",
+            )
+    return gr.update(), gr.update(), gr.update(), "Module not found."
+
+
+def refresh_modules_tab():
+    mod_choices = module_dd_choices()
+    return gr.update(choices=mod_choices, value=mod_choices[0][1] if mod_choices else None)
 
 
 def session_label(sid: str, entry: dict) -> str:
@@ -171,6 +336,44 @@ def refresh_gaps_tab():
 # ---------------------------------------------------------------------------
 # Tab 1 — Chat helpers
 # ---------------------------------------------------------------------------
+
+def _format_history(history, max_turns=6):
+    """Format Gradio chat history into a plain text block for the LLM prompt.
+
+    Handles both string content and Gradio's list-of-parts content format.
+    """
+    if not history:
+        return ""
+
+    recent = history[-(max_turns * 2):] if max_turns else history
+    formatted = []
+
+    for entry in recent:
+        raw = entry.get("content")
+
+        # Content can be a string OR a list of message parts. Normalize.
+        if isinstance(raw, list):
+            text_parts = []
+            for part in raw:
+                if isinstance(part, dict):
+                    text_parts.append(part.get("text", ""))
+                elif isinstance(part, str):
+                    text_parts.append(part)
+            content = " ".join(text_parts)
+        elif isinstance(raw, str):
+            content = raw
+        else:
+            content = str(raw) if raw is not None else ""
+
+        content = content.strip()
+        if not content:
+            continue
+
+        role = entry.get("role", "user").upper()
+        formatted.append(f"{role}: {content}")
+
+    return "\n".join(formatted)
+
 
 def _format_docs_md(details: list[dict]) -> str:
     if not details:
@@ -232,15 +435,26 @@ def chat_fn(
     session_id = scope_to_session_id(scope)
     partial, source_details, pubmed_articles = "", [], []
 
+    # Expand any module IDs in the filter to their constituent filenames.
+    expanded_filter = expand_selection(doc_filter) if doc_filter else []
+
+    history_for_llm = _format_history(history, max_turns=6)
+    history_for_pubmed = _format_history(history, max_turns=3)
+
     pubmed_results = None
     if pubmed_on:
-        pubmed_results = search_pubmed(message, max_results=int(pubmed_max))
+        query = reformulate_for_pubmed(message, history_for_pubmed, expanded_filter)
+        if query:
+            pubmed_results = search_pubmed(query, max_results=int(pubmed_max))
+        else:
+            print("[PubMed] reformulation returned empty — skipping", flush=True)
 
     try:
         for token in query_stream(
             message, session_id,
-            doc_ids=doc_filter or None,
+            doc_ids=expanded_filter or None,
             pubmed_results=pubmed_results,
+            conversation_history=history_for_llm,
         ):
             if isinstance(token, dict):
                 source_details = token.get("source_details", [])
@@ -275,53 +489,68 @@ def poll_live_gap() -> tuple[str, str]:
 
 
 def _qa_handler(session) -> None:
-    """Full Q&A cycle: RAG → answer → TTS. Runs in a daemon thread."""
+    """Full Q&A cycle: RAG → synthesize → browser audio. Runs in a daemon thread."""
     question = session.pending_question
     print(f"[Q&A] handler started, question: {question!r}", flush=True)
     try:
         _set_status("Thinking...")
         pause_recording()
         print("[Q&A] mic paused, calling answer_question()", flush=True)
-        answer = answer_question(question, session.linked_documents)
+        answer, sources = answer_question(question, session.linked_documents, session)
         print(f"[Q&A] got answer ({len(answer)} chars)", flush=True)
-        session.add_qa_entry(question, answer)
+        session.add_qa_entry(question, answer, sources)
         _set_status("Speaking...")
         tts = _get_tts()
         if tts:
-            print("[Q&A] calling tts.speak()", flush=True)
-            tts.speak(answer)
-            print("[Q&A] tts.speak() returned", flush=True)
+            print("[Q&A] synthesizing audio", flush=True)
+            wav_bytes = tts.synthesize(answer)
+            audio_path = _save_qa_audio(wav_bytes)
+            _set_qa_audio(audio_path)
+            duration_s = len(wav_bytes) / (tts.sample_rate * 2)
+            print(f"[Q&A] audio ready ({duration_s:.1f}s), mic resumes in {duration_s + 0.5:.1f}s", flush=True)
+            threading.Timer(duration_s + 0.5, _resume_after_playback, args=(session,)).start()
+            return
         else:
-            print("[Q&A] TTS unavailable — answer not spoken", flush=True)
+            print("[Q&A] TTS unavailable", flush=True)
     except Exception:
         traceback.print_exc()
-        tts = _get_tts()
-        if tts:
-            try:
-                tts.speak("Sorry, I could not answer that.")
-            except Exception:
-                traceback.print_exc()
-    finally:
-        resume_recording()
-        session.set_mode(Mode.LECTURE)
-        _set_status("● Recording lecture")
-        print("[Q&A] handler done, mode → LECTURE", flush=True)
+        try:
+            tts = _get_tts()
+            if tts:
+                wav_bytes = tts.synthesize("Sorry, I could not answer that.")
+                audio_path = _save_qa_audio(wav_bytes)
+                _set_qa_audio(audio_path)
+                duration_s = len(wav_bytes) / (tts.sample_rate * 2)
+                threading.Timer(duration_s + 0.5, _resume_after_playback, args=(session,)).start()
+                return
+        except Exception:
+            traceback.print_exc()
+    # Fallback: TTS unavailable or synthesis failed — resume immediately
+    resume_recording()
+    session.set_mode(Mode.LECTURE)
+    _set_status("● Recording lecture")
+    print("[Q&A] handler done (no audio), mode → LECTURE", flush=True)
 
 
 def start_recording(device_str: str | None, lecture_name: str, linked_docs: list[str]):
     global _live_gap_worker, _live_gap_result, _live_gap_updated
     try:
+        # Expand any module IDs to their constituent document filenames.
+        expanded_docs = expand_selection(linked_docs or [])
         session = start_live_session(
             device=parse_device(device_str),
             name=lecture_name.strip(),
-            linked_documents=linked_docs or [],
+            linked_documents=expanded_docs,
         )
         session.register_qa_handler(_qa_handler)
-        _set_status("● Recording lecture")
+        if expanded_docs:
+            _set_status("● Recording lecture")
+        else:
+            _set_status("● Recording lecture (no source material linked — Ask AI will be disabled until you link a document)")
         with _live_gap_lock:
             _live_gap_result = (
                 "Link a document to enable live gap analysis"
-                if not linked_docs else "Waiting for more content..."
+                if not expanded_docs else "Waiting for more content..."
             )
             _live_gap_updated = None
         _live_gap_worker = LiveGapWorker(get_current_session, _on_live_gap)
@@ -385,6 +614,11 @@ def ask_ai_fn() -> str:
     if session.current_mode() != Mode.LECTURE:
         print("[ASK AI] not in LECTURE mode — ignoring", flush=True)
         return _get_status()
+    if not session.linked_documents:
+        print("[ASK AI] no linked documents — refusing to enter Q&A mode")
+        msg = "● No document linked — select source material first"
+        _set_status(msg)
+        return msg
     session.set_mode(Mode.AWAITING_QUESTION)
     _set_status("Listening for question...")
     print("[ASK AI] mode → AWAITING_QUESTION", flush=True)
@@ -392,16 +626,21 @@ def ask_ai_fn() -> str:
 
 
 def cancel_qa() -> str:
-    """Force mode back to LECTURE, stop TTS, and resume the mic."""
-    tts = _get_tts()
-    if tts:
-        tts.stop()
+    """Force mode back to LECTURE, clear pending audio, and resume the mic."""
+    _set_qa_audio(None)
     resume_recording()
     session = get_current_session()
     if session:
         session.set_mode(Mode.LECTURE)
     _set_status("● Recording lecture")
     return "● Recording lecture"
+
+
+def poll_qa_audio():
+    path = _get_and_clear_qa_audio()
+    if path:
+        return gr.update(value=path)
+    return gr.update()
 
 
 def poll_cancel_btn() -> dict:
@@ -467,6 +706,7 @@ def run_gaps(session_choice: str, use_latest: bool, show_thinking: bool):
 # ---------------------------------------------------------------------------
 
 def build_ui() -> gr.Blocks:
+    _init_qa_audio_dir()
     gap_choices = gap_dropdown_choices()
     doc_choices = doc_dropdown_choices()
 
@@ -489,7 +729,7 @@ def build_ui() -> gr.Blocks:
                 scope_dd = gr.Dropdown(choices=scope_choices(), value="All material",
                                        label="Scope queries to", scale=1)
                 doc_filter_dd = gr.Dropdown(
-                    choices=doc_dropdown_choices(), multiselect=True,
+                    choices=unified_source_choices(), multiselect=True,
                     label="Search in (leave empty for all)", scale=3,
                 )
             with gr.Row():
@@ -517,7 +757,7 @@ def build_ui() -> gr.Blocks:
                         pubmed_html.render()
 
             chat_tab.select(
-                fn=lambda: gr.update(choices=doc_dropdown_choices()),
+                fn=lambda: gr.update(choices=unified_source_choices()),
                 outputs=[doc_filter_dd],
             )
 
@@ -528,7 +768,7 @@ def build_ui() -> gr.Blocks:
                                           placeholder="e.g. Neuro Week 5")
             with gr.Row():
                 linked_docs_dd = gr.Dropdown(
-                    choices=doc_choices, multiselect=True,
+                    choices=unified_source_choices(), multiselect=True,
                     label="Source material for this lecture", scale=3,
                 )
                 refresh_docs_btn = gr.Button("↻", scale=0, min_width=40)
@@ -558,18 +798,27 @@ def build_ui() -> gr.Blocks:
                 qa_log_box = gr.Textbox(label="", lines=8,
                                         interactive=False, autoscroll=True)
 
+            qa_audio = gr.Audio(
+                label="AI Response",
+                autoplay=True,
+                visible=True,
+                streaming=False,
+                interactive=False,
+            )
+
             # Timers
             timer = gr.Timer(value=2)
             timer.tick(fn=poll_transcript, outputs=[transcript_box])
             timer.tick(fn=poll_status, outputs=[status_box])
             timer.tick(fn=poll_qa_log, outputs=[qa_log_box])
             timer.tick(fn=poll_cancel_btn, outputs=[cancel_btn])
+            timer.tick(fn=poll_qa_audio, outputs=[qa_audio])
             gap_timer = gr.Timer(value=5)
             gap_timer.tick(fn=poll_live_gap, outputs=[gap_box, gap_ts_md])
 
             # Intra-tab events
             refresh_docs_btn.click(
-                fn=lambda: gr.update(choices=doc_dropdown_choices()),
+                fn=lambda: gr.update(choices=unified_source_choices()),
                 outputs=[linked_docs_dd],
             )
             ask_ai_btn.click(fn=ask_ai_fn, outputs=[status_box])
@@ -586,7 +835,70 @@ def build_ui() -> gr.Blocks:
             process_log = gr.Textbox(label="Progress log", lines=10, interactive=False)
             process_btn.click(fn=process_uploads, inputs=[upload], outputs=[process_log])
 
-        # ── Tab 4: Gaps Analysis ─────────────────────────────────────────
+        # ── Tab 4: Modules ───────────────────────────────────────────────
+        with gr.Tab("Modules") as modules_tab:
+            with gr.Row():
+                module_dd = gr.Dropdown(
+                    choices=module_dd_choices(), label="Module", scale=3,
+                )
+                mod_refresh_btn = gr.Button("↻", scale=0, min_width=40)
+            with gr.Row():
+                new_mod_tb = gr.Textbox(
+                    label="New module name",
+                    placeholder="e.g. Week 3 – Synaptic Plasticity",
+                    scale=3,
+                )
+                create_mod_btn = gr.Button("Create", scale=0, min_width=80)
+            with gr.Row():
+                rename_mod_tb = gr.Textbox(
+                    label="Rename selected to", placeholder="New name", scale=3,
+                )
+                rename_mod_btn = gr.Button("Rename", scale=0, min_width=80)
+            with gr.Row():
+                delete_mod_btn = gr.Button("Delete Selected", variant="stop",
+                                           scale=0, min_width=120)
+                confirm_delete_btn = gr.Button("Confirm Delete", variant="stop",
+                                               interactive=False, scale=0, min_width=120)
+            mod_docs_dd = gr.Dropdown(
+                choices=doc_dropdown_choices(), multiselect=True,
+                label="Documents in this module",
+            )
+            save_mod_docs_btn = gr.Button("Save Documents", variant="primary")
+            modules_status_tb = gr.Textbox(label="", interactive=False, lines=1)
+
+            mod_refresh_btn.click(fn=refresh_modules_tab, outputs=[module_dd])
+            modules_tab.select(fn=refresh_modules_tab, outputs=[module_dd])
+            module_dd.change(
+                fn=load_module_docs_fn, inputs=[module_dd], outputs=[mod_docs_dd],
+            )
+            create_mod_btn.click(
+                fn=create_module_fn,
+                inputs=[new_mod_tb],
+                outputs=[module_dd, linked_docs_dd, doc_filter_dd, new_mod_tb, modules_status_tb],
+            )
+            rename_mod_btn.click(
+                fn=rename_module_fn,
+                inputs=[module_dd, rename_mod_tb],
+                outputs=[module_dd, linked_docs_dd, doc_filter_dd, modules_status_tb],
+            )
+            delete_mod_btn.click(
+                fn=delete_module_stage1,
+                inputs=[module_dd],
+                outputs=[confirm_delete_btn, modules_status_tb],
+            )
+            confirm_delete_btn.click(
+                fn=delete_module_stage2,
+                inputs=[module_dd],
+                outputs=[module_dd, linked_docs_dd, doc_filter_dd,
+                         confirm_delete_btn, modules_status_tb],
+            )
+            save_mod_docs_btn.click(
+                fn=save_module_docs_fn,
+                inputs=[module_dd, mod_docs_dd],
+                outputs=[module_dd, linked_docs_dd, doc_filter_dd, modules_status_tb],
+            )
+
+        # ── Tab 5: Gaps Analysis ─────────────────────────────────────────
         with gr.Tab("Gaps Analysis") as gaps_tab:
             with gr.Row():
                 gap_dd = gr.Dropdown(

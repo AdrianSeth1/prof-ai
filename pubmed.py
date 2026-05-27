@@ -1,19 +1,24 @@
 """
 pubmed.py — PubMed search via NCBI E-utilities.
-No external dependencies beyond the standard library.
+No external dependencies beyond the standard library (except ollama for query reformulation).
 """
 
 import json
 import logging
+import re
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
+
+import ollama
 
 # TODO: replace with a real email address for NCBI compliance
 NCBI_EMAIL = "your-email@example.com"
 NCBI_TOOL = "prof-ai-assistant"
+REFORMULATE_MODEL = "qwen3:14b"
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 EFETCH_URL  = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
@@ -143,6 +148,58 @@ def _parse_article(article_el: ET.Element) -> dict | None:
 # Public API
 # ---------------------------------------------------------------------------
 
+def reformulate_for_pubmed(
+    user_question: str,
+    conversation_history: str,
+    selected_doc_titles: list[str],
+) -> str | None:
+    """Rewrite a natural-language question into a PubMed-optimised search query.
+
+    Returns None if the model produces an unusable result (caller should skip PubMed).
+    """
+    titles_str = ", ".join(selected_doc_titles) if selected_doc_titles else "none"
+    prompt = (
+        "You convert a researcher's question into a PubMed search query. "
+        "Return ONLY the search query string. No explanation. No quotes. "
+        "Do NOT include date filters - those are added by Python separately.\n\n"
+        "GUIDELINES:\n"
+        "- Use 2-3 concept groups joined by AND. More than that returns too few results.\n"
+        "- For broad exploratory questions like 'what's new', 'what would extend this', "
+        "or 'what recent research', prefer BROADER queries. The main topic plus a recency "
+        "hint like (novel OR emerging OR recent) is often enough.\n"
+        "- For specific mechanistic questions, you can be more targeted.\n"
+        "- Do NOT invent constraints. Do not add age groups, populations, geographic "
+        "limits, or other filters that weren't in the question or the source materials.\n"
+        "- Use OR within a concept group to catch synonyms. MeSH terms are good when obvious.\n\n"
+        f"Selected source materials: {titles_str}\n"
+        f"Recent conversation: {conversation_history}\n"
+        f"Current question: {user_question}\n\n"
+        "EXAMPLES:\n\n"
+        "Question: 'What recent research extends the dopamine hypothesis?'\n"
+        "Good: (dopamine hypothesis OR dopaminergic dysfunction) AND (schizophrenia OR psychosis) AND (novel OR recent)\n\n"
+        "Question: 'Are there new genetic findings for schizophrenia?'\n"
+        "Good: schizophrenia AND (genetic OR genomic OR GWAS) AND (novel OR emerging)\n\n"
+        "Question: 'What research would make these schizophrenia slides more interesting?'\n"
+        "Good: schizophrenia AND (novel OR emerging OR breakthrough) AND (mechanism OR treatment OR pathophysiology)\n\n"
+        "BAD (too narrow, invented constraints): schizophrenia AND adolescent AND treatment AND antipsychotics AND clinical trial\n\n"
+        "Search query:"
+    )
+    try:
+        response = ollama.chat(
+            model=REFORMULATE_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = _THINK_RE.sub("", response["message"]["content"]).strip().strip("\"'")
+        if len(raw) < 5:
+            logger.warning("PubMed reformulator returned too-short result: %r", raw)
+            return None
+        print(f"[PubMed] reformulated query: {raw}", flush=True)
+        return raw
+    except Exception:
+        logger.exception("PubMed reformulator failed for question %r", user_question)
+        return None
+
+
 def search_pubmed(
     query: str,
     max_results: int = 5,
@@ -153,20 +210,19 @@ def search_pubmed(
     Results are cached in memory for the lifetime of the process.
     Returns [] on network or parse errors (logged to stderr).
     """
-    cache_key = f"{query}|{max_results}|{recency_years}"
+    today = date.today()
+    min_date = (today - timedelta(days=recency_years * 365)).strftime("%Y/%m/%d")
+    max_date = today.strftime("%Y/%m/%d")
+
+    cache_key = f"{query}|{max_results}|{min_date}"
     if cache_key in _cache:
         return _cache[cache_key]
 
-    today = date.today()
-    try:
-        min_date = today.replace(year=today.year - recency_years).strftime("%Y/%m/%d")
-    except ValueError:
-        # Feb 29 edge case on non-leap years
-        min_date = today.replace(year=today.year - recency_years, day=28).strftime("%Y/%m/%d")
-    max_date = today.strftime("%Y/%m/%d")
+    print(f"[PubMed] date range: {min_date} to {max_date}", flush=True)
 
     try:
         pmids = _esearch(query, max_results, min_date, max_date)
+        print(f"[PubMed] esearch returned {len(pmids)} PMIDs: {pmids}", flush=True)
         if not pmids:
             _cache[cache_key] = []
             return []
@@ -177,6 +233,9 @@ def search_pubmed(
             for article_el in root.findall("PubmedArticle")
             if (parsed := _parse_article(article_el)) is not None
         ]
+        print(f"[PubMed] efetched {len(results)} abstracts", flush=True)
+        for a in results:
+            print(f"  - [{a['pmid']}] {a['title'][:80]}... ({a['pub_date']})", flush=True)
     except Exception:
         logger.exception("PubMed search failed for query %r", query)
         return []

@@ -13,7 +13,7 @@ import sounddevice as sd
 from piper.voice import PiperVoice
 
 MODELS_DIR = Path(__file__).parent / "models" / "piper"
-DEFAULT_MODEL = "en_US-lessac-medium.onnx"
+DEFAULT_MODEL = "en_US-libritts-high.onnx"
 
 
 class PiperTTS:
@@ -26,23 +26,31 @@ class PiperTTS:
         self._sample_rate: int = self._voice.config.sample_rate
         self._lock = threading.Lock()
 
-    def speak(self, text: str) -> None:
-        """Synthesize text and play through the default output device. Blocking."""
+    @property
+    def sample_rate(self) -> int:
+        return self._sample_rate
+
+    def synthesize(self, text: str) -> bytes:
+        """Synthesize text and return WAV bytes (16-bit mono PCM). Does not play audio."""
         wav_io = io.BytesIO()
         with wave.open(wav_io, "wb") as wav_out:
             wav_out.setnchannels(1)
             wav_out.setsampwidth(2)  # 16-bit PCM
             wav_out.setframerate(self._sample_rate)
-            self._voice.synthesize(text, wav_out)
-        wav_io.seek(0)
-        with wave.open(wav_io, "rb") as wav_in:
+            self._voice.synthesize_wav(text, wav_out)
+        return wav_io.getvalue()
+
+    def speak(self, text: str) -> None:
+        """Synthesize text and play through the default output device. Blocking."""
+        wav_bytes = self.synthesize(text)
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wav_in:
             raw = wav_in.readframes(wav_in.getnframes())
         audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
         with self._lock:
             sd.play(audio, samplerate=self._sample_rate, blocking=True)
 
     def stop(self) -> None:
-        """Interrupt current playback."""
+        """Interrupt current sounddevice playback (server-side speak() only)."""
         sd.stop()
 
 

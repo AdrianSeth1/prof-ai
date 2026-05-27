@@ -128,4 +128,5 @@ class LiveGapWorker:
                 result += token
         except Exception as e:
             result = f"⚠ {e}"
+        session.latest_gap_analysis = result
         self._on_result(result, datetime.now())

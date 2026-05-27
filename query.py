@@ -35,6 +35,10 @@ SYSTEM_PROMPT_WITH_PUBMED = (
     "Cite sources inline using [Doc: <filename>] or [PubMed: <PMID>] format. "
     "Distinguish clearly between content from the professor's materials and recent literature. "
     "When literature contradicts or extends the course materials, note it explicitly. "
+    "When recent literature is provided, integrate it into your answer — the user has "
+    "explicitly requested current research. Do not refuse to answer just because the "
+    "course materials are older. Use the literature to extend or update what the slides "
+    "cover. Always cite which source you drew from. "
     "If neither source answers the question, say so plainly rather than guessing."
 )
 
@@ -97,14 +101,13 @@ def build_pubmed_context(articles: list[dict]) -> str:
 def _build_where(
     session_id: str | None,
     doc_ids: list[str] | None,
-) -> dict | None:
-    clauses = []
+) -> dict:
+    # Chat always restricts to ingested source documents, not live lecture transcripts.
+    clauses = [{"content_type": "source_document"}]
     if session_id:
-        clauses.append({"session_id": {"$eq": session_id}})
+        clauses.append({"session_id": session_id})
     if doc_ids:
         clauses.append({"source_file": {"$in": doc_ids}})
-    if not clauses:
-        return None
     return clauses[0] if len(clauses) == 1 else {"$and": clauses}
 
 
@@ -113,6 +116,7 @@ def query_stream(
     session_id: str | None = None,
     doc_ids: list[str] | None = None,
     pubmed_results: list[dict] | None = None,
+    conversation_history: str = "",
 ) -> Iterator[str | dict]:
     """Yield LLM response tokens, then finally yield {"sources": [...], "pubmed": [...]}.
 
@@ -132,10 +136,8 @@ def query_stream(
         "query_embeddings": [embed(question)],
         "n_results": min(TOP_K, collection.count()),
         "include": ["documents", "metadatas"],
+        "where": _build_where(session_id, doc_ids),
     }
-    where = _build_where(session_id, doc_ids)
-    if where:
-        query_kwargs["where"] = where
 
     results = collection.query(**query_kwargs)
     local_context, sources, source_details = build_context(results)
@@ -153,9 +155,13 @@ def query_stream(
         combined_context = local_context
         system = SYSTEM_PROMPT
 
+    history_section = (
+        f"\n\n=== CONVERSATION HISTORY ===\n\n{conversation_history}"
+        if conversation_history else ""
+    )
     messages = [
         {"role": "system", "content": system},
-        {"role": "user", "content": f"Context:\n\n{combined_context}\n\nQuestion: {question}"},
+        {"role": "user", "content": f"Context:\n\n{combined_context}{history_section}\n\nQuestion: {question}"},
     ]
     for chunk in ollama.chat(model=LLM_MODEL, messages=messages, stream=True):
         yield chunk["message"]["content"]

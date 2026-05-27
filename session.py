@@ -43,6 +43,7 @@ class LectureSession:
         self.pending_question: str = ""
         self.qa_history: list[dict] = []
         self._qa_handler: Callable[["LectureSession"], None] | None = None
+        self.latest_gap_analysis: str = ""
 
     # ------------------------------------------------------------------
     # Mode management
@@ -64,10 +65,11 @@ class LectureSession:
     # Q&A history
     # ------------------------------------------------------------------
 
-    def add_qa_entry(self, question: str, answer: str) -> None:
+    def add_qa_entry(self, question: str, answer: str, sources: list[str] | None = None) -> None:
         self.qa_history.append({
             "question": question,
             "answer": answer,
+            "sources": sources or [],
             "timestamp": datetime.now().isoformat(),
         })
 
@@ -77,7 +79,11 @@ class LectureSession:
         lines = []
         for e in self.qa_history:
             ts = datetime.fromisoformat(e["timestamp"]).strftime("%H:%M:%S")
-            lines.append(f"[{ts}] Q: {e['question']}\n       A: {e['answer']}")
+            entry = f"[{ts}] Q: {e['question']}\n       A: {e['answer']}"
+            sources = e.get("sources", [])
+            if sources:
+                entry += f"\n       Sources: {', '.join(sources)}"
+            lines.append(entry)
         return "\n\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -117,6 +123,7 @@ class LectureSession:
             metadatas=[{
                 "source_file": f"lecture_{self.session_id}",
                 "file_type": "lecture_audio",
+                "content_type": "lecture_transcript",
                 "session_id": self.session_id,
                 "segment_index": seg_index,
                 "lecture_date": self.start_time.strftime("%Y-%m-%d"),
