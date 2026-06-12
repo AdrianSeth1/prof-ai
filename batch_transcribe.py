@@ -28,7 +28,16 @@ from faster_whisper import WhisperModel
 from ingest import chunk_text, get_collection
 
 EMBED_MODEL = "nomic-embed-text"
-WHISPER_MODEL = "medium"
+WHISPER_MODEL = "large-v3-turbo"
+NO_SPEECH_THRESHOLD = 0.7
+LOG_PROB_THRESHOLD = -0.8
+
+DEFAULT_INITIAL_PROMPT = (
+    "This is a university lecture. The speaker may use academic terminology, "
+    "cite authors and theorists by name, reference published works, and use "
+    "field-specific jargon. Names, acronyms, and theory titles should be "
+    "transcribed accurately."
+)
 
 _model: WhisperModel | None = None
 
@@ -54,8 +63,10 @@ def transcribe_file(path: Path) -> Iterator[str]:
             str(path),
             language="en",
             beam_size=5,
-            no_speech_threshold=0.6,
+            no_speech_threshold=NO_SPEECH_THRESHOLD,
+            log_prob_threshold=LOG_PROB_THRESHOLD,
             condition_on_previous_text=False,
+            initial_prompt=DEFAULT_INITIAL_PROMPT,
         )
         texts = [seg.text.strip() for seg in segments_gen if seg.text.strip()]
     except Exception as e:
