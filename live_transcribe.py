@@ -38,6 +38,11 @@ MIN_AVG_LOGPROB = -1.0
 NO_SPEECH_THRESHOLD = 0.7
 LOG_PROB_THRESHOLD = -0.8
 
+HALLUCINATION_PHRASES = (
+    "thank you for watching", "thanks for watching", "please subscribe",
+    "see you in the next video", "subtitles by", "like and subscribe",
+)
+
 QA_BUFFER_SECONDS = 4.0    # initial window to collect speech after Ask AI is clicked
 QA_TAIL_SECONDS = 1.5      # silence after last speech before closing the buffer
 QA_TRUNCATION_WAIT = 2.0   # extra wait when transcript looks like a mid-sentence fragment
@@ -136,7 +141,7 @@ def build_whisper_prompt(session: "LectureSession") -> str:
 
     combined = "\n\n".join(sampled_texts)[:4000]
     extraction_prompt = (
-        "/no_think List 20-30 technical terms, proper nouns, or specialized vocabulary "
+        "List 20-30 technical terms, proper nouns, or specialized vocabulary "
         "from the following text. Output as a comma-separated list with no explanation, "
         "no numbering, no preamble. Focus on words that a general speech recognizer might "
         "mis-transcribe — names, jargon, acronyms, theory names, author names. "
@@ -148,6 +153,7 @@ def build_whisper_prompt(session: "LectureSession") -> str:
         response = ollama.chat(
             model=VOCAB_MODEL,
             messages=[{"role": "user", "content": extraction_prompt}],
+            options={"think": False},
         )
         raw_vocab = _THINK_RE.sub("", response["message"]["content"]).strip()
         if not raw_vocab:
@@ -193,11 +199,18 @@ def transcribe_audio(model: WhisperModel, audio: np.ndarray, initial_prompt: str
         log_prob_threshold=LOG_PROB_THRESHOLD,
         condition_on_previous_text=False,
         initial_prompt=initial_prompt if initial_prompt else None,
+        vad_filter=True,
+        vad_parameters={"min_silence_duration_ms": 250},
+        temperature=0.0,
     )
     texts, logprobs = [], []
     for seg in segments_gen:
         t = seg.text.strip()
         if t:
+            lower_t = t.lower()
+            if any(phrase in lower_t for phrase in HALLUCINATION_PHRASES) and seg.no_speech_prob > 0.3:
+                print(f"[Whisper] dropped hallucination segment: {t!r}", flush=True)
+                continue
             texts.append(t)
             logprobs.append(seg.avg_logprob)
     if not texts:

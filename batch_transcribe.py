@@ -32,6 +32,11 @@ WHISPER_MODEL = "large-v3-turbo"
 NO_SPEECH_THRESHOLD = 0.7
 LOG_PROB_THRESHOLD = -0.8
 
+HALLUCINATION_PHRASES = (
+    "thank you for watching", "thanks for watching", "please subscribe",
+    "see you in the next video", "subtitles by", "like and subscribe",
+)
+
 DEFAULT_INITIAL_PROMPT = (
     "This is a university lecture. The speaker may use academic terminology, "
     "cite authors and theorists by name, reference published works, and use "
@@ -67,8 +72,19 @@ def transcribe_file(path: Path) -> Iterator[str]:
             log_prob_threshold=LOG_PROB_THRESHOLD,
             condition_on_previous_text=False,
             initial_prompt=DEFAULT_INITIAL_PROMPT,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 250},
+            temperature=0.0,
         )
-        texts = [seg.text.strip() for seg in segments_gen if seg.text.strip()]
+        texts = []
+        for seg in segments_gen:
+            t = seg.text.strip()
+            if t:
+                lower_t = t.lower()
+                if any(phrase in lower_t for phrase in HALLUCINATION_PHRASES) and seg.no_speech_prob > 0.3:
+                    print(f"[Whisper] dropped hallucination segment: {t!r}", flush=True)
+                    continue
+                texts.append(t)
     except Exception as e:
         yield f"  ERROR: {e}"
         return
