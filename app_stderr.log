@@ -1,0 +1,10 @@
+ERROR:    [Errno 10048] error while attempting to bind on address ('0.0.0.0', 7860): only one usage of each socket address (protocol/network address/port) is normally permitted
+Traceback (most recent call last):
+  File "C:\prof-ai\app.py", line 1893, in <module>
+    build_ui().launch(server_name="0.0.0.0", server_port=7860, theme=gr.themes.Soft(), share=True, auth=("prof", "password"))
+  File "C:\prof-ai\venv\Lib\site-packages\gradio\blocks.py", line 2774, in launch
+    ) = http_server.start_server(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\prof-ai\venv\Lib\site-packages\gradio\http_server.py", line 182, in start_server
+    raise OSError(
+OSError: Cannot find empty port in range: 7860-7860. You can specify a different port by setting the GRADIO_SERVER_PORT environment variable or passing the `server_port` parameter to `launch()`.

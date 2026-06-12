@@ -44,6 +44,9 @@ class LectureSession:
         self.qa_history: list[dict] = []
         self._qa_handler: Callable[["LectureSession"], None] | None = None
         self.latest_gap_analysis: str = ""
+        self.whisper_initial_prompt: str = ""
+        self.in_conversation: bool = False
+        self.conversation_history: list[dict] = []
 
     # ------------------------------------------------------------------
     # Mode management
@@ -65,13 +68,28 @@ class LectureSession:
     # Q&A history
     # ------------------------------------------------------------------
 
-    def add_qa_entry(self, question: str, answer: str, sources: list[str] | None = None) -> None:
-        self.qa_history.append({
+    def add_qa_entry(
+        self,
+        question: str,
+        answer: str,
+        sources: list[str] | None = None,
+        reasoning: str = "",
+    ) -> None:
+        entry: dict = {
             "question": question,
             "answer": answer,
             "sources": sources or [],
             "timestamp": datetime.now().isoformat(),
-        })
+        }
+        if reasoning:
+            entry["reasoning"] = reasoning
+        self.qa_history.append(entry)
+
+    def write_transcript_marker(self, text: str) -> None:
+        """Write a non-segment marker line into the transcript file."""
+        if self._transcript_path and self._transcript_path.exists():
+            with self._transcript_path.open("a", encoding="utf-8") as f:
+                f.write(f"\n{text}\n\n")
 
     def format_qa_log(self) -> str:
         if not self.qa_history:
@@ -147,6 +165,7 @@ class LectureSession:
             "end_time": datetime.now().isoformat(),
             "segment_count": len(self.segments),
             "qa_history": self.qa_history,
+            "conversation_history": self.conversation_history,
         }
         save_manifest(SESSIONS_MANIFEST, manifest)
         print(f"Session {self.session_id} saved ({len(self.segments)} segments).")

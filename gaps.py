@@ -10,6 +10,7 @@ Usage:
 import argparse
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Iterator
 
@@ -23,7 +24,7 @@ TRANSCRIPTS_DIR = Path("transcripts") / "sessions"
 SESSIONS_MANIFEST = Path("sessions.json")
 COLLECTION_NAME = "course_material"
 EMBED_MODEL = "nomic-embed-text"
-LLM_MODEL = "qwen3:30b-a3b"
+LLM_MODEL = "qwen3:14b"
 TOP_K = 15
 # Truncate transcript for the query embedding — very long text dilutes topical signal
 EMBED_MAX_WORDS = 1500
@@ -138,7 +139,7 @@ def _think_filter(messages: list[dict], show_thinking: bool) -> Iterator[str]:
     """Generator: yields LLM tokens with <think> blocks suppressed or kept."""
     buf = ""
     in_think = False
-    for chunk in ollama.chat(model=LLM_MODEL, messages=messages, stream=True):
+    for chunk in ollama.chat(model=LLM_MODEL, messages=messages, stream=True, think=False):
         buf += chunk["message"]["content"]
         while buf:
             if not in_think:
@@ -227,7 +228,7 @@ def gaps_stream(session_id: str, show_thinking: bool = False) -> Iterator[str]:
         if linked_docs else ""
     )
     prompt = (
-        "/think Below is a lecture transcript and the corresponding planned "
+        "Below is a lecture transcript and the corresponding planned "
         f"notes and slides for the same topic.\n\n{doc_scope}"
         f"LECTURE TRANSCRIPT:\n{transcript}\n\n"
         f"PLANNED NOTES AND SLIDES:\n{chunks_text}\n\n"
@@ -239,7 +240,10 @@ def gaps_stream(session_id: str, show_thinking: bool = False) -> Iterator[str]:
         "Format your response as a bulleted list of gaps, each with the "
         "source file it came from."
     )
-    yield from _think_filter([{"role": "user", "content": prompt}], show_thinking)
+    t0 = time.time()
+    for token in _think_filter([{"role": "user", "content": prompt}], show_thinking):
+        yield token
+    print(f"[GAP] llm {time.time() - t0:.1f}s", flush=True)
 
 
 # ---------------------------------------------------------------------------

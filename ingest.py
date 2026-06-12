@@ -22,6 +22,7 @@ COLLECTION_NAME = "course_material"
 EMBED_MODEL = "nomic-embed-text"
 CHUNK_WORDS = 500
 OVERLAP_WORDS = 50
+OCR_MIN_CHARS = 100  # below this threshold, treat PDF as scanned and attempt OCR
 
 
 def get_collection() -> chromadb.Collection:
@@ -50,6 +51,57 @@ def extract_pdf(path: Path) -> list[dict]:
     return pages
 
 
+def extract_pdf_ocr(path: Path) -> list[dict]:
+    """OCR fallback for scanned PDFs. Requires pytesseract, pdf2image, and tesseract installed at OS level."""
+    try:
+        from pdf2image import convert_from_path
+        import pytesseract
+    except ImportError:
+        print("  [OCR] Missing packages. Run: pip install pytesseract pdf2image", file=sys.stderr, flush=True)
+        return []
+
+    # Check tesseract binary before converting pages — avoids a cryptic error 24 pages in
+    try:
+        pytesseract.get_tesseract_version()
+    except pytesseract.TesseractNotFoundError:
+        print(
+            "  [OCR] Tesseract is not installed at the OS level. "
+            "Download the Windows installer from https://github.com/UB-Mannheim/tesseract/wiki "
+            "and add it to PATH, then retry.",
+            file=sys.stderr, flush=True,
+        )
+        return []
+
+    try:
+        images = convert_from_path(str(path))
+    except Exception as e:
+        print(f"  [OCR] PDF-to-image conversion failed: {e}", file=sys.stderr, flush=True)
+        return []
+
+    pages = []
+    total = len(images)
+    for i, image in enumerate(images, start=1):
+        print(f"  [OCR] page {i}/{total}...", flush=True)
+        try:
+            text = pytesseract.image_to_string(image)
+        except Exception as e:
+            print(f"  [OCR] Page {i} failed: {e}", file=sys.stderr, flush=True)
+            continue
+        if text.strip():
+            pages.append({"text": text, "page": i})
+
+    return pages
+
+
+def extract_txt(path: Path) -> list[dict]:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+    except Exception as e:
+        print(f"  WARNING: could not read {path.name}: {e}", file=sys.stderr)
+        return []
+    return [{"text": text, "page": None}] if text else []
+
+
 def extract_docx(path: Path) -> list[dict]:
     doc = Document(str(path))
     text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
@@ -74,6 +126,7 @@ def extract_pptx(path: Path) -> list[dict]:
 
 EXTRACTORS = {
     ".pdf": extract_pdf,
+    ".txt": extract_txt,
     ".docx": extract_docx,
     ".pptx": extract_pptx,
 }
@@ -118,18 +171,30 @@ def ingest_file(path: Path, collection: chromadb.Collection, manifest: dict) -> 
 
     if manifest.get(key) == mtime:
         print(f"  Skipping (unchanged): {path.name}")
-        return
+        return 0
 
     suffix = path.suffix.lower()
     extractor = EXTRACTORS.get(suffix)
     if extractor is None:
-        return
+        return 0
 
     print(f"  Processing: {path.name}")
     sections = extractor(path)
+    use_ocr = False
+
+    if suffix == ".pdf":
+        total_chars = sum(len(s["text"]) for s in sections)
+        if total_chars < OCR_MIN_CHARS:
+            print(
+                f"    PDF appears to be scanned ({total_chars} chars extracted), running OCR...",
+                flush=True,
+            )
+            sections = extract_pdf_ocr(path)
+            use_ocr = True
+
     if not sections:
-        print(f"    No text extracted from {path.name}")
-        return
+        print(f"    No text extracted from {path.name}", flush=True)
+        return 0
 
     ids, embeddings, documents, metadatas = [], [], [], []
     chunk_index = 0
@@ -143,6 +208,8 @@ def ingest_file(path: Path, collection: chromadb.Collection, manifest: dict) -> 
                 "file_type": suffix.lstrip("."),
                 "content_type": "source_document",
             }
+            if use_ocr:
+                meta["extraction_method"] = "ocr"
             # page_or_slide is meaningful for PDF and PPTX
             if section["page"] is not None:
                 meta["page_or_slide"] = section["page"]
@@ -172,6 +239,7 @@ def ingest_paths(paths: Iterable[Path]) -> Iterator[str]:
     for path in paths:
         yield f"Processing {path.name}…"
         n = ingest_file(path, collection, manifest)
+        n = n or 0  # guard: ingest_file should always return int, but prevent TypeError if it doesn't
         yield f"  → {'skipped (unchanged)' if n == 0 else f'{n} chunks stored'}"
         total += n
     save_manifest(MANIFEST_PATH, manifest)

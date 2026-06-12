@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(New-Item *)",
+      "PowerShell(cd C:\\\\prof-ai; foreach \\($f in @\\(\"session.py\",\"live_transcribe.py\",\"app.py\",\"qa.py\",\"tts.py\"\\)\\) { venv\\\\Scripts\\\\python -c \"import ast; ast.parse\\(open\\('$f', encoding='utf-8'\\).read\\(\\)\\); print\\('$f OK'\\)\" })",
+      "PowerShell(cd C:\\\\prof-ai; foreach \\($f in @\\(\"live_transcribe.py\",\"app.py\"\\)\\) { venv\\\\Scripts\\\\python -c \"import ast; ast.parse\\(open\\('$f', encoding='utf-8'\\).read\\(\\)\\); print\\('$f OK'\\)\" })",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "PowerShell(cd C:\\\\prof-ai; foreach \\($f in @\\(\"query.py\",\"app.py\"\\)\\) { venv\\\\Scripts\\\\python -c \"import ast; ast.parse\\(open\\('$f', encoding='utf-8'\\).read\\(\\)\\); print\\('$f OK'\\)\" })",
+      "Bash(python -c ' *)",
+      "Bash(venv/Scripts/python -c \"import ast; ast.parse\\(open\\('pubmed.py',encoding='utf-8'\\).read\\(\\)\\); print\\('pubmed.py OK'\\)\")",
+      "Bash(venv/Scripts/python -c ' *)",
+      "PowerShell(Move-Item *)",
+      "PowerShell(Get-ChildItem C:\\\\Prof-AI -File | Where-Object { $_.Name -notmatch \"^venv\" } | Select-Object Name, Length | Sort-Object Name)",
+      "PowerShell(nvidia-smi 2>&1)",
+      "Bash(Remove-Item -Path \"C:\\\\Prof-AI\\\\modules.py\" -Force)",
+      "Bash(python *)",
+      "PowerShell(& \"C:\\\\prof-ai\\\\venv\\\\Scripts\\\\python.exe\" \"C:\\\\prof-ai\\\\_verify_reorder.py\")"
+    ]
+  }
+}

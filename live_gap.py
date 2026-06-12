@@ -3,6 +3,7 @@ live_gap.py — background real-time gap analysis during lecture recording.
 """
 
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterator
@@ -13,11 +14,12 @@ import ollama
 CHROMA_DIR = Path("chroma_db")
 COLLECTION_NAME = "course_material"
 EMBED_MODEL = "nomic-embed-text"
-LLM_MODEL = "qwen3:30b-a3b"
+LLM_MODEL = "qwen3:14b"
 
-LIVE_GAP_INTERVAL = 60   # seconds between analysis runs
-MIN_WORDS_FOR_GAP = 50   # minimum transcript words before analysing
+LIVE_GAP_INTERVAL = 60       # seconds between analysis runs
+MIN_WORDS_FOR_GAP = 50       # minimum transcript words before analysing
 TOP_K = 10
+MAX_TRANSCRIPT_CHARS = 4000  # cap on transcript delta sent per run
 
 
 def _get_chunks(transcript: str, linked_docs: list[str]) -> str:
@@ -61,7 +63,7 @@ def _get_chunks(transcript: str, linked_docs: list[str]) -> str:
 
 
 def live_gaps_stream(transcript: str, linked_docs: list[str]) -> Iterator[str]:
-    """Yield gap analysis tokens quickly using /no_think."""
+    """Yield gap analysis tokens for a transcript delta."""
     chunks = _get_chunks(transcript, linked_docs)
     if not chunks:
         yield "No course material found."
@@ -69,17 +71,19 @@ def live_gaps_stream(transcript: str, linked_docs: list[str]) -> Iterator[str]:
 
     doc_scope = f"Comparing against: {', '.join(linked_docs)}\n\n" if linked_docs else ""
     prompt = (
-        "/no_think You are reviewing a lecture in progress. Be concise.\n\n"
+        "You are reviewing a lecture in progress. Be concise.\n\n"
         f"{doc_scope}"
-        f"LECTURE SO FAR:\n{transcript}\n\n"
+        f"RECENT LECTURE CONTENT:\n{transcript}\n\n"
         f"NOTES/SLIDES:\n{chunks}\n\n"
-        "List topics from the notes/slides NOT yet covered in the lecture. "
-        "Bullet points only. If everything covered so far, say so."
+        "List topics from the notes/slides NOT covered in this recent section. "
+        "Bullet points only. If everything covered, say so."
     )
     for chunk in ollama.chat(
         model=LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],
         stream=True,
+        think=False,
+        keep_alive="10m",
     ):
         yield chunk["message"]["content"]
 
@@ -96,6 +100,7 @@ class LiveGapWorker:
         self._on_result = on_result
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._last_segment_count: int = 0
 
     def start(self) -> None:
         self._stop.clear()
@@ -118,15 +123,30 @@ class LiveGapWorker:
         if not session.linked_documents:
             self._on_result("Link a document to enable live gap analysis", None)
             return
-        transcript = " ".join(seg["text"] for seg in session.segments)
-        if len(transcript.split()) < MIN_WORDS_FOR_GAP:
+
+        # Skip run if no new segments have arrived since the last analysis
+        if len(session.segments) == self._last_segment_count:
+            return
+
+        full_words = sum(len(seg["text"].split()) for seg in session.segments)
+        if full_words < MIN_WORDS_FOR_GAP:
             self._on_result("Waiting for more content...", None)
             return
+
+        # Send only the delta since the last run, capped at MAX_TRANSCRIPT_CHARS
+        new_segs = session.segments[self._last_segment_count:]
+        delta = " ".join(seg["text"] for seg in new_segs)
+        if len(delta) > MAX_TRANSCRIPT_CHARS:
+            delta = delta[-MAX_TRANSCRIPT_CHARS:]
+        self._last_segment_count = len(session.segments)
+
         result = ""
+        t0 = time.time()
         try:
-            for token in live_gaps_stream(transcript, session.linked_documents):
+            for token in live_gaps_stream(delta, session.linked_documents):
                 result += token
         except Exception as e:
             result = f"⚠ {e}"
+        print(f"[GAP-LIVE] llm {time.time() - t0:.1f}s", flush=True)
         session.latest_gap_analysis = result
         self._on_result(result, datetime.now())

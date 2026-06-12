@@ -7,7 +7,11 @@ Usage:
 """
 
 import argparse
+import logging
+import re
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterator
 
@@ -15,13 +19,20 @@ import chromadb
 import ollama
 
 from manifest import load_manifest
+from pubmed import search_pubmed
+from semantic_scholar import search_semantic_scholar
+from openalex import search_openalex
 
 CHROMA_DIR = Path("chroma_db")
 SESSIONS_MANIFEST = Path("sessions.json")
 COLLECTION_NAME = "course_material"
 EMBED_MODEL = "nomic-embed-text"
 LLM_MODEL = "qwen3:30b-a3b"
+REFORMULATE_MODEL = "qwen3:14b"
 TOP_K = 6
+
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
     "You are a research assistant helping a professor. Answer based on the provided "
@@ -29,10 +40,11 @@ SYSTEM_PROMPT = (
     "than guessing. When you make a claim, mention which source file it came from."
 )
 
-SYSTEM_PROMPT_WITH_PUBMED = (
+SYSTEM_PROMPT_WITH_LITERATURE = (
     "You are a research assistant helping a professor. You have been given both the "
-    "professor's course materials and recent PubMed literature. "
-    "Cite sources inline using [Doc: <filename>] or [PubMed: <PMID>] format. "
+    "professor's course materials and recent academic literature from one or more databases. "
+    "Cite sources inline: [Doc: <filename>] for course materials, [PubMed: <PMID>] for PubMed, "
+    "[Semantic Scholar: <ID>] for Semantic Scholar, [OpenAlex: <ID>] for OpenAlex. "
     "Distinguish clearly between content from the professor's materials and recent literature. "
     "When literature contradicts or extends the course materials, note it explicitly. "
     "When recent literature is provided, integrate it into your answer — the user has "
@@ -41,6 +53,157 @@ SYSTEM_PROMPT_WITH_PUBMED = (
     "cover. Always cite which source you drew from. "
     "If neither source answers the question, say so plainly rather than guessing."
 )
+
+
+# ---------------------------------------------------------------------------
+# Shared query reformulation (works for all three literature sources)
+# ---------------------------------------------------------------------------
+
+def reformulate_for_search(
+    user_question: str,
+    conversation_history: str,
+    selected_doc_titles: list[str],
+) -> str | None:
+    """Rewrite a natural-language question into a broad academic keyword search query.
+
+    Returns None if the model produces an unusable result.
+    """
+    titles_str = ", ".join(selected_doc_titles) if selected_doc_titles else "none"
+    prompt = (
+        "You convert a researcher's question into a broad academic keyword search query. "
+        "Return ONLY the search query string. No explanation. No quotes. "
+        "Do NOT include date filters — those are added separately.\n\n"
+        "GUIDELINES:\n"
+        "- Use 2-3 concept groups joined by AND.\n"
+        "- For exploratory questions, prefer broader queries with OR synonyms.\n"
+        "- Do not invent constraints not present in the question.\n"
+        "- Boolean syntax (AND, OR, parentheses) is fine.\n\n"
+        f"Selected source materials: {titles_str}\n"
+        f"Recent conversation: {conversation_history}\n"
+        f"Question: {user_question}\n\n"
+        "Search query:"
+    )
+    try:
+        t0 = time.time()
+        response = ollama.chat(
+            model=REFORMULATE_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            think=False,
+        )
+        print(f"[Literature] llm {time.time() - t0:.1f}s", flush=True)
+        raw = _THINK_RE.sub("", response["message"]["content"]).strip().strip("\"'")
+        if len(raw) < 5:
+            logger.warning("Search reformulator returned too-short result: %r", raw)
+            return None
+        return raw
+    except Exception:
+        logger.exception("Search reformulator failed for question %r", user_question)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Multi-source literature search
+# ---------------------------------------------------------------------------
+
+def _dedupe_literature(results: list[dict]) -> list[dict]:
+    """Remove duplicates by DOI first, then by normalized title."""
+    seen_dois: set[str] = set()
+    seen_titles: set[str] = set()
+    deduped = []
+    for r in results:
+        doi = r.get("doi")
+        if doi and doi in seen_dois:
+            continue
+        title_norm = re.sub(r"\W+", " ", (r.get("title") or "").lower()).strip()
+        if title_norm in seen_titles:
+            continue
+        if doi:
+            seen_dois.add(doi)
+        if title_norm:
+            seen_titles.add(title_norm)
+        deduped.append(r)
+    return deduped
+
+
+def build_literature_context(articles: list[dict]) -> str:
+    """Build a context block for the LLM from a mixed list of literature results."""
+    blocks = []
+    for a in articles:
+        source = a.get("source", "")
+        authors = a.get("authors", [])
+        author_str = ", ".join(authors[:5]) + (" et al." if len(authors) > 5 else "")
+        abstract = a.get("abstract") or "No abstract available."
+
+        if source == "pubmed":
+            label = f"[PubMed: {a.get('pmid', '')}]"
+            venue_str = f"{a.get('journal', '')} | {a.get('pub_date', '')}"
+        elif source == "semantic_scholar":
+            label = f"[Semantic Scholar: {a.get('id', '')}]"
+            venue_str = f"{a.get('venue', '') or 'unknown venue'} | {a.get('year', '')}"
+        elif source == "openalex":
+            label = f"[OpenAlex: {a.get('id', '')}]"
+            venue_str = f"{a.get('venue', '') or 'unknown venue'} | {a.get('year', '')}"
+        else:
+            label = f"[Literature: {a.get('id', '?')}]"
+            venue_str = str(a.get("year", ""))
+
+        blocks.append(
+            f"{label} {a.get('title', '')} ({venue_str})\n"
+            f"Authors: {author_str}\n"
+            f"Abstract: {abstract}"
+        )
+    return "\n\n".join(blocks)
+
+
+def search_literature(
+    question: str,
+    sources: list[str],
+    conversation_history: str = "",
+    selected_doc_titles: list[str] | None = None,
+    max_results: int = 5,
+) -> list[dict]:
+    """Search selected literature sources in parallel and return deduplicated results.
+
+    sources: any subset of ["pubmed", "semantic_scholar", "openalex"].
+    Returns [] when sources is empty or all searches fail.
+    """
+    if not sources:
+        return []
+
+    query = reformulate_for_search(question, conversation_history, selected_doc_titles or [])
+    if not query:
+        print("[Literature] reformulation failed — skipping all sources", flush=True)
+        return []
+    print(f"[Literature] reformulated query: {query!r}", flush=True)
+
+    def _search_one(source: str) -> list[dict]:
+        try:
+            if source == "pubmed":
+                results = search_pubmed(query, max_results=max_results)
+                return [{**r, "source": "pubmed"} for r in results]
+            elif source == "semantic_scholar":
+                return search_semantic_scholar(query, max_results=max_results)
+            elif source == "openalex":
+                return search_openalex(query, max_results=max_results)
+            else:
+                print(f"[Literature] unknown source {source!r}", flush=True)
+                return []
+        except Exception as e:
+            print(f"[Literature] {source} failed: {e}", flush=True)
+            return []
+
+    all_results: list[dict] = []
+    with ThreadPoolExecutor(max_workers=len(sources)) as pool:
+        futures = {pool.submit(_search_one, s): s for s in sources}
+        for fut in as_completed(futures):
+            source = futures[fut]
+            batch = fut.result()
+            print(f"[Literature] {source}: {len(batch)} result(s)", flush=True)
+            all_results.extend(batch)
+
+    deduped = _dedupe_literature(all_results)
+    print(f"[Literature] {len(deduped)} after dedup (from {len(all_results)} raw)", flush=True)
+    return deduped
 
 
 def embed(text: str) -> list[float]:
@@ -115,7 +278,7 @@ def query_stream(
     question: str,
     session_id: str | None = None,
     doc_ids: list[str] | None = None,
-    pubmed_results: list[dict] | None = None,
+    literature_results: list[dict] | None = None,
     conversation_history: str = "",
 ) -> Iterator[str | dict]:
     """Yield LLM response tokens, then finally yield {"sources": [...], "pubmed": [...]}.
@@ -142,15 +305,15 @@ def query_stream(
     results = collection.query(**query_kwargs)
     local_context, sources, source_details = build_context(results)
 
-    if pubmed_results:
-        pubmed_context = build_pubmed_context(pubmed_results)
+    if literature_results:
+        lit_context = build_literature_context(literature_results)
         combined_context = (
             "=== LOCAL DOCUMENT CONTEXT ===\n\n"
             + local_context
-            + "\n\n=== RECENT LITERATURE (PubMed) ===\n\n"
-            + pubmed_context
+            + "\n\n=== RECENT LITERATURE ===\n\n"
+            + lit_context
         )
-        system = SYSTEM_PROMPT_WITH_PUBMED
+        system = SYSTEM_PROMPT_WITH_LITERATURE
     else:
         combined_context = local_context
         system = SYSTEM_PROMPT
@@ -165,7 +328,7 @@ def query_stream(
     ]
     for chunk in ollama.chat(model=LLM_MODEL, messages=messages, stream=True):
         yield chunk["message"]["content"]
-    yield {"sources": sources, "source_details": source_details, "pubmed": pubmed_results or []}
+    yield {"sources": sources, "source_details": source_details, "literature": literature_results or []}
 
 
 def resolve_session(args: argparse.Namespace) -> str | None:

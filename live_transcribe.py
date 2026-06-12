@@ -153,14 +153,29 @@ def build_whisper_prompt(session: "LectureSession") -> str:
         response = ollama.chat(
             model=VOCAB_MODEL,
             messages=[{"role": "user", "content": extraction_prompt}],
-            options={"think": False},
+            think=False,
         )
         raw_vocab = _THINK_RE.sub("", response["message"]["content"]).strip()
         if not raw_vocab:
             raise ValueError("empty response from vocabulary model")
 
-        # Split into terms and classify: multi-word + starts-capital → proper noun, else concept
-        terms = [t.strip() for t in raw_vocab.split(",") if t.strip()]
+        # Split into terms, drop junk (dates, bare numbers, 1-2 char fragments,
+        # duplicates) — the extractor sometimes shreds a title like
+        # "Workshop, September 30, 2014" into useless single tokens that then
+        # bias Whisper. Then classify: multi-word + starts-capital → proper
+        # noun, else concept.
+        terms, seen = [], set()
+        for raw_term in raw_vocab.split(","):
+            term = raw_term.strip()
+            if not term or len(term) < 3:
+                continue
+            if term.replace(".", "").replace("/", "").replace("-", "").isdigit():
+                continue
+            key = term.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            terms.append(term)
         proper, concepts = [], []
         for term in terms:
             words = term.split()
@@ -201,7 +216,10 @@ def transcribe_audio(model: WhisperModel, audio: np.ndarray, initial_prompt: str
         initial_prompt=initial_prompt if initial_prompt else None,
         vad_filter=True,
         vad_parameters={"min_silence_duration_ms": 250},
-        temperature=0.0,
+        # Short retry ladder, not the full default schedule. 0.0-only disables
+        # the escape hatch for repetition loops ("university university ...").
+        # The full default ladder (up to 1.0) is what fabricates completions.
+        temperature=[0.0, 0.2, 0.4],
     )
     texts, logprobs = [], []
     for seg in segments_gen:

@@ -4,6 +4,7 @@ qa.py — RAG-based question answering for live lectures.
 
 import re
 import sys
+import time
 from pathlib import Path
 
 import chromadb
@@ -17,6 +18,21 @@ LLM_MODEL = "qwen3:30b-a3b"
 TOP_K = 6
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def sanitize_answer(text: str) -> str:
+    """Strip inlined reasoning from the content field.
+
+    Safety net for clients that inline the thinking trace into content
+    instead of returning it in response.message.thinking. Applied after
+    the dedicated thinking field is already extracted.
+    If a closing </think> tag is present, keep only what follows the last one.
+    Then strip any complete <think>...</think> block that might remain.
+    """
+    if "</think>" in text:
+        text = text.rsplit("</think>", 1)[-1]
+    text = _THINK_RE.sub("", text)
+    return text.strip()
 
 
 def _retrieve_chunks(question: str, linked_docs: list[str]) -> tuple[str, list[str]]:
@@ -94,8 +110,20 @@ def _format_qa_history(session, max_turns: int = 2) -> str:
     return "\n".join(lines)
 
 
-def answer_question(question: str, linked_docs: list[str], session=None) -> tuple[str, list[str]]:
-    """Return (answer, source_files) using the full transcript and linked doc chunks."""
+def _format_conversation_history(session, max_turns: int = 10) -> str:
+    """Return the last N turns from session.conversation_history as Q/A lines."""
+    hist = getattr(session, "conversation_history", None)
+    if not hist:
+        return ""
+    lines = []
+    for entry in hist[-max_turns:]:
+        lines.append(f'Q: {entry["question"]}')
+        lines.append(f'A: {entry["answer"]}')
+    return "\n".join(lines)
+
+
+def answer_question(question: str, linked_docs: list[str], session=None) -> tuple[str, str, list[str]]:
+    """Return (answer, reasoning, source_files) using the full transcript and linked doc chunks."""
     transcript_text = _load_transcript(session)
     qa_history_text = _format_qa_history(session)
 
@@ -115,7 +143,7 @@ RECENT Q&A (this conversation so far):
 """ if qa_history_text else ""
 
     if linked_docs and doc_context:
-        prompt = f"""/think You are a teaching assistant feeding a professor useful information during a live lecture.
+        prompt = f"""You are a teaching assistant feeding a professor useful information during a live lecture.
 
 LECTURE TRANSCRIPT (what was actually said so far):
 {transcript_text if transcript_text else "(no transcript yet)"}
@@ -139,7 +167,7 @@ Avoid: "circle back", "dive into", "connect the dots", "let's", "going forward".
 
 Respond conversationally — not reading a list. Group related ideas into a theme or two, give a sentence of context per theme, and close with a clear takeaway. Be warm, curious, and direct. No bullet points, no headers, no colons introducing lists. Two to four sentences total."""
     else:
-        prompt = f"""/think You are a teaching assistant feeding a professor useful information during a live lecture.
+        prompt = f"""You are a teaching assistant feeding a professor useful information during a live lecture.
 
 No source material is linked to this lecture session. Answer based only on the transcript and recent conversation.
 
@@ -156,19 +184,101 @@ Avoid: "circle back", "dive into", "connect the dots", "let's", "going forward".
 
 Respond conversationally — not reading a list. Be warm, curious, and direct. No bullet points, no headers, no colons introducing lists. Two to four sentences total."""
 
+    t0 = time.time()
     response = ollama.chat(
         model=LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],
+        think=True,
+        keep_alive="30m",
     )
-    answer = _THINK_RE.sub("", response["message"]["content"]).strip()
-    return answer, source_files
+    print(f"[Q&A] llm {time.time() - t0:.1f}s", flush=True)
+
+    # Read answer and reasoning as separate fields.
+    # sanitize_answer is a safety net for clients that inline the trace into content.
+    answer = sanitize_answer(response["message"]["content"])
+    reasoning = response["message"].get("thinking") or ""
+    if reasoning:
+        print(f"[Q&A] reasoning {len(reasoning)} chars", flush=True)
+    return answer, reasoning, source_files
+
+
+def answer_conversation_turn(
+    question: str,
+    linked_docs: list[str],
+    session=None,
+    max_history_turns: int = 10,
+    fast: bool = False,
+) -> tuple[str, str, list[str]]:
+    """Return (answer, reasoning, source_files) for one conversation turn.
+
+    Uses session.conversation_history (not qa_history) so conversation context
+    stays separate from single-turn Q&A context. fast=True uses think=False and
+    requests a shorter spoken reply.
+    """
+    transcript_text = _load_transcript(session)
+    history_text = _format_conversation_history(session, max_turns=max_history_turns)
+
+    if linked_docs:
+        doc_context, source_files = _retrieve_chunks(question, linked_docs)
+    else:
+        doc_context, source_files = "", []
+
+    print(
+        f"[CONV] context sizes — doc:{len(doc_context)} "
+        f"transcript:{len(transcript_text)} history:{len(history_text)}",
+        flush=True,
+    )
+
+    history_block = f"\nRECENT CONVERSATION:\n{history_text}\n" if history_text else ""
+    length_instruction = (
+        "Reply in one or two sentences — spoken word style, no lists."
+        if fast else
+        "Give a thorough answer the professor can act on. No bullet points, no headers."
+    )
+
+    if linked_docs and doc_context:
+        prompt = f"""You are a teaching assistant in a multi-turn conversation with a professor.
+
+PRIOR LECTURE TRANSCRIPT:
+{transcript_text if transcript_text else "(no transcript yet)"}
+
+SOURCE MATERIAL (slides/notes):
+{doc_context}
+{history_block}
+The professor says: "{question}"
+
+{length_instruction} Be direct and conversational. Speak as a knowledgeable colleague."""
+    else:
+        prompt = f"""You are a teaching assistant in a multi-turn conversation with a professor.
+
+PRIOR LECTURE TRANSCRIPT:
+{transcript_text if transcript_text else "(no transcript yet)"}
+{history_block}
+The professor says: "{question}"
+
+{length_instruction} Be direct and conversational. Speak as a knowledgeable colleague."""
+
+    t0 = time.time()
+    response = ollama.chat(
+        model=LLM_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        think=not fast,
+        keep_alive="30m",
+    )
+    print(f"[CONV] llm {time.time() - t0:.1f}s", flush=True)
+
+    answer = sanitize_answer(response["message"]["content"])
+    reasoning = response["message"].get("thinking") or ""
+    if reasoning:
+        print(f"[CONV] reasoning {len(reasoning)} chars", flush=True)
+    return answer, reasoning, source_files
 
 
 if __name__ == "__main__":
     q = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "What is this course about?"
     print(f"Question: {q}\n")
     print("Retrieving and answering...")
-    ans, sources = answer_question(q, linked_docs=[])
+    ans, _reasoning, sources = answer_question(q, linked_docs=[])
     print(f"\nAnswer: {ans}")
     if sources:
         print(f"Sources: {', '.join(sources)}")

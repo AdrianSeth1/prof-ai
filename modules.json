@@ -1,0 +1,71 @@
+[
+  {
+    "id": "mod_70cac2f8e67d",
+    "name": "something important",
+    "documents": [
+      "Communication Training_Chapter1.pptx",
+      "ModelTrainingEffectivenessTXT.pdf",
+      "Chapter2_Learning Styles.pptx",
+      "Chapter 8.pptx",
+      "Chapter2_LearningStyles_Day2.pptx",
+      "Chapter 11 & 12 - Visual Aids and Delivery.pptx"
+    ],
+    "created_at": "2026-05-26T21:37:59.971391",
+    "class_name": "training"
+  },
+  {
+    "id": "mod_d123182eb7a0",
+    "name": "Training Plan Week 1",
+    "documents": [
+      "ModelTrainingEffectivenessTXT.pdf"
+    ],
+    "created_at": "2026-05-27T20:59:14.262975",
+    "class_id": "cls_5f8a769ea315"
+  },
+  {
+    "id": "mod_4532ca36a921",
+    "name": "Adult Learning Styles Week 2",
+    "documents": [
+      "KolbLearningStyles.pdf"
+    ],
+    "created_at": "2026-05-27T21:01:58.481122",
+    "class_id": "cls_5f8a769ea315"
+  },
+  {
+    "id": "mod_6dc689bab208",
+    "name": "Training plan week 2",
+    "documents": [],
+    "created_at": "2026-05-28T03:36:00.972752",
+    "class_id": "cls_5f8a769ea315"
+  },
+  {
+    "id": "mod_7806dc1020f9",
+    "name": "Chapter 3 Needs Assessment",
+    "documents": [
+      "Chapter 11 & 12 - Visual Aids and Delivery.pptx",
+      "Chapter2_LearningStyles_Day2.pptx",
+      "Chapter2_Learning Styles.pptx"
+    ],
+    "created_at": "2026-05-28T10:39:37.147491"
+  },
+  {
+    "id": "mod_43bfee887fb9",
+    "name": "comms 202",
+    "documents": [
+      "Chapter 8.pptx",
+      "Chapter2_Learning Styles.pptx",
+      "Communication Training_Chapter1.pptx"
+    ],
+    "created_at": "2026-05-28T13:27:34.858801",
+    "class_id": null
+  },
+  {
+    "id": "mod_6dee14196334",
+    "name": "something important 2",
+    "documents": [
+      "_OceanofPDF.com_Who_Painted_My_Money_White_-_Sree_Iyer.pdf"
+    ],
+    "created_at": "2026-06-01T23:27:18.725692",
+    "class_id": "cls_3634a3a5be63"
+  }
+]

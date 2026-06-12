@@ -74,7 +74,8 @@ def transcribe_file(path: Path) -> Iterator[str]:
             initial_prompt=DEFAULT_INITIAL_PROMPT,
             vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 250},
-            temperature=0.0,
+            # Short retry ladder — see comment in live_transcribe.py.
+            temperature=[0.0, 0.2, 0.4],
         )
         texts = []
         for seg in segments_gen:

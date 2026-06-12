@@ -9,3 +9,4 @@ models/
 .gradio/
 sessions.json
 manifest.json
+.aider*

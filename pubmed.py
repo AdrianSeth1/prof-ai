@@ -6,6 +6,7 @@ No external dependencies beyond the standard library (except ollama for query re
 import json
 import logging
 import re
+import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -185,10 +186,13 @@ def reformulate_for_pubmed(
         "Search query:"
     )
     try:
+        t0 = time.time()
         response = ollama.chat(
             model=REFORMULATE_MODEL,
             messages=[{"role": "user", "content": prompt}],
+            think=False,
         )
+        print(f"[PubMed] llm {time.time() - t0:.1f}s", flush=True)
         raw = _THINK_RE.sub("", response["message"]["content"]).strip().strip("\"'")
         if len(raw) < 5:
             logger.warning("PubMed reformulator returned too-short result: %r", raw)
