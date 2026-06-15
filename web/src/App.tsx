@@ -135,7 +135,7 @@ export default function App() {
 
         <main style={{ flex: 1, overflow: 'hidden', position: 'relative' }}>
           {screen === 'chat'      && <Chat />}
-          {screen === 'live'      && <LiveLecture />}
+          {screen === 'live'      && <LiveLecture onToast={addToast} />}
           {screen === 'materials' && <AddMaterials onToast={addToast} />}
           {screen === 'modules'   && <Modules onToast={addToast} />}
           {screen === 'gaps'      && <GapsAnalysis onToast={addToast} />}

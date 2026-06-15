@@ -10,11 +10,15 @@ import json
 import re
 import subprocess
 import sys
+import time
+from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 
 import httpx
+import numpy as np
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -38,7 +42,41 @@ from batch_transcribe import transcribe_file                                    
 from manifest import load_manifest                                              # noqa: E402
 from gaps import gaps_stream, resolve_session_id as _resolve_session_id        # noqa: E402
 
-app = FastAPI(title="Prof AI API", docs_url="/api/docs")
+# Phase 5B: live lecture imports (importing live_transcribe also runs the
+# Windows NVIDIA DLL PATH fix at module load time — must stay before app init)
+from live_transcribe import (                                                   # noqa: E402
+    _get_model, transcribe_audio,
+    start_live_session, stop_live_session, get_current_session,
+    push_question_audio,
+)
+from session import Mode                                                         # noqa: E402
+from qa import answer_question, answer_conversation_turn                         # noqa: E402
+from tts import PiperTTS                                                         # noqa: E402
+from live_gap import LiveGapWorker                                               # noqa: E402
+
+# Minimum quality thresholds matching live_transcribe.py constants
+_MIN_WORDS = 2
+_MIN_AVG_LOGPROB = -1.0
+
+# Singletons preloaded at startup
+_whisper = None
+_tts: PiperTTS | None = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _whisper, _tts
+    loop = asyncio.get_running_loop()
+    print("[STARTUP] pre-warming Whisper (large-v3-turbo · CUDA float16)…", flush=True)
+    _whisper = await loop.run_in_executor(_THREAD_POOL, _get_model)
+    print("[STARTUP] Whisper ready", flush=True)
+    print("[STARTUP] pre-warming Piper TTS…", flush=True)
+    _tts = await loop.run_in_executor(_THREAD_POOL, PiperTTS)
+    print(f"[STARTUP] TTS ready — sample_rate={_tts.sample_rate} Hz", flush=True)
+    yield
+
+
+app = FastAPI(title="Prof AI API", docs_url="/api/docs", lifespan=lifespan)
 
 # Allow the Vite dev server to call the API during development
 app.add_middleware(
@@ -357,6 +395,237 @@ def get_sessions():
         })
     print(f"[SESSIONS] {len(sessions)} session(s)", flush=True)
     return {"sessions": sessions}
+
+
+# ── Live lecture WebSocket (Phase 5B) ────────────────────────────
+
+@app.websocket("/ws/lecture")
+async def ws_lecture(ws: WebSocket):
+    await ws.accept()
+    loop = asyncio.get_running_loop()
+
+    # Outbound queue: dict messages or raw bytes → drained to WS by async task
+    outbound: asyncio.Queue[dict | bytes | None] = asyncio.Queue()
+    buf: list[bytes] = []          # accumulated PCM for current utterance
+    session = None
+    gap_worker: LiveGapWorker | None = None
+    paused = False
+    ws_session_start: float = 0.0
+
+    def emit(obj: dict) -> None:
+        loop.call_soon_threadsafe(outbound.put_nowait, obj)
+
+    def emit_bytes(b: bytes) -> None:
+        loop.call_soon_threadsafe(outbound.put_nowait, b)
+
+    async def drain() -> None:
+        while True:
+            item = await outbound.get()
+            if item is None:
+                break
+            try:
+                if isinstance(item, bytes):
+                    await ws.send_bytes(item)
+                else:
+                    await ws.send_text(json.dumps(item))
+            except Exception:
+                break
+
+    drain_task = asyncio.create_task(drain())
+
+    def qa_handler(sess) -> None:
+        """Runs in a bg thread after push_question_audio captures a question."""
+        question = sess.pending_question or ""
+        print(f"[WS/lecture] QA: {question!r}", flush=True)
+        emit({"type": "question", "text": question})
+        tts_inst = _tts
+        if tts_inst is None:
+            sess.set_mode(Mode.LECTURE)
+            emit({"type": "state", "mode": "lecture"})
+            return
+        try:
+            if sess.in_conversation:
+                answer, reasoning, sources = answer_conversation_turn(
+                    question, sess.linked_documents, sess
+                )
+                sess.conversation_history.append({"question": question, "answer": answer})
+            else:
+                answer, reasoning, sources = answer_question(
+                    question, sess.linked_documents, sess
+                )
+            sess.add_qa_entry(question, answer, sources=sources, reasoning=reasoning)
+            emit({"type": "answer", "text": answer, "sources": sources, "reasoning": reasoning})
+            emit({"type": "state", "mode": "speaking"})
+            wav = tts_inst.synthesize(answer)
+            emit({"type": "tts_start"})
+            emit_bytes(wav)
+            emit({"type": "tts_end"})
+        except Exception as exc:
+            import traceback
+            print(f"[WS/lecture] QA handler error:\n{traceback.format_exc()}", flush=True)
+            emit({"type": "error", "message": str(exc)})
+        finally:
+            sess.set_mode(Mode.LECTURE)
+            emit({"type": "state", "mode": "lecture"})
+
+    try:
+        while True:
+            msg = await ws.receive()
+
+            if msg.get("type") == "websocket.disconnect":
+                break
+
+            raw_bytes = msg.get("bytes")
+            if raw_bytes:
+                if session is None or paused:
+                    continue
+                mode = session.current_mode()
+                if mode in (Mode.LECTURE, Mode.AWAITING_QUESTION):
+                    buf.append(raw_bytes)
+                continue
+
+            text_data = msg.get("text")
+            if not text_data:
+                continue
+            try:
+                data = json.loads(text_data)
+            except json.JSONDecodeError:
+                continue
+
+            kind = data.get("type")
+
+            if kind == "start":
+                name = (data.get("name") or "").strip()
+                if not name:
+                    name = f"Lecture {datetime.now().strftime('%b %d')}"
+                linked_docs = data.get("linked_documents") or []
+                try:
+                    session = start_live_session(name=name, linked_documents=linked_docs)
+                    session.register_qa_handler(qa_handler)
+                    ws_session_start = time.time()
+
+                    def on_gap(result, ts):
+                        emit({"type": "gap", "text": result,
+                              "ts": ts.isoformat() if ts else None})
+
+                    gap_worker = LiveGapWorker(get_current_session, on_gap)
+                    gap_worker.start()
+
+                    await ws.send_text(json.dumps({
+                        "type": "started",
+                        "session_id": session.session_id,
+                        "name": session.name,
+                    }))
+                    await ws.send_text(json.dumps({"type": "state", "mode": "lecture"}))
+                    print(f"[WS/lecture] session started: {session.session_id}", flush=True)
+                except RuntimeError as exc:
+                    await ws.send_text(json.dumps({"type": "error", "message": str(exc)}))
+
+            elif kind == "flush":
+                if not buf or session is None:
+                    buf.clear()
+                    continue
+                raw = b"".join(buf)
+                buf.clear()
+                mode = session.current_mode()
+
+                if mode == Mode.LECTURE:
+                    raw_copy = raw
+                    sess_ref = session
+                    t_start = ws_session_start
+
+                    def do_transcribe(rb=raw_copy, sess=sess_ref, t0=t_start):
+                        pcm_i16 = np.frombuffer(rb, dtype=np.int16)
+                        pcm_f32 = pcm_i16.astype(np.float32) / 32768.0
+                        ts = time.perf_counter()
+                        model = _get_model()
+                        text, conf = transcribe_audio(model, pcm_f32, sess.whisper_initial_prompt)
+                        ms = int((time.perf_counter() - ts) * 1000)
+                        if text and len(text.split()) >= _MIN_WORDS and conf >= _MIN_AVG_LOGPROB:
+                            end_s = time.time() - t0
+                            start_s = max(0.0, end_s - len(pcm_f32) / 16000.0)
+                            sess.append_segment(text, start_s, end_s)
+                        return text, conf, ms
+
+                    text, conf, ms = await loop.run_in_executor(_THREAD_POOL, do_transcribe)
+                    if text:
+                        await ws.send_text(json.dumps({
+                            "type": "transcript",
+                            "text": text,
+                            "confidence": round(conf, 3),
+                            "ms": ms,
+                        }))
+
+                elif mode == Mode.AWAITING_QUESTION:
+                    raw_copy = raw
+
+                    def do_question(rb=raw_copy):
+                        pcm_i16 = np.frombuffer(rb, dtype=np.int16)
+                        pcm_f32 = pcm_i16.astype(np.float32) / 32768.0
+                        push_question_audio(pcm_f32)
+
+                    await loop.run_in_executor(_THREAD_POOL, do_question)
+
+            elif kind == "ask_ai":
+                if session:
+                    session.set_mode(Mode.AWAITING_QUESTION)
+                    buf.clear()
+                    await ws.send_text(json.dumps({"type": "state", "mode": "awaiting"}))
+
+            elif kind == "cancel":
+                if session and session.current_mode() == Mode.AWAITING_QUESTION:
+                    session.set_mode(Mode.LECTURE)
+                    buf.clear()
+                    await ws.send_text(json.dumps({"type": "state", "mode": "lecture"}))
+
+            elif kind == "pause_mic":
+                paused = True
+                await ws.send_text(json.dumps({"type": "state", "mode": "paused"}))
+
+            elif kind == "resume_mic":
+                paused = False
+                if session:
+                    mode_map = {
+                        Mode.LECTURE:           "lecture",
+                        Mode.AWAITING_QUESTION: "awaiting",
+                        Mode.PROCESSING:        "processing",
+                    }
+                    m = mode_map.get(session.current_mode(), "lecture")
+                else:
+                    m = "lecture"
+                await ws.send_text(json.dumps({"type": "state", "mode": m}))
+
+            elif kind == "set_conversation_mode":
+                if session:
+                    session.in_conversation = bool(data.get("enabled", False))
+                    print(f"[WS/lecture] conversation_mode={session.in_conversation}", flush=True)
+
+            elif kind == "stop":
+                if gap_worker:
+                    gap_worker.stop()
+                    gap_worker = None
+                if session:
+                    stop_live_session()
+                    session = None
+                await ws.send_text(json.dumps({"type": "stopped"}))
+                break
+
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        import traceback
+        print(f"[WS/lecture] unexpected error:\n{traceback.format_exc()}", flush=True)
+    finally:
+        drain_task.cancel()
+        try:
+            await drain_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        if gap_worker:
+            gap_worker.stop()
+        if session and session.is_active:
+            stop_live_session()
+        print("[WS/lecture] connection closed", flush=True)
 
 
 # ── Gaps endpoint (Phase 4) ───────────────────────────────────────
