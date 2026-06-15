@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import FindingCard from '../components/FindingCard'
+import type { Finding } from '../components/FindingCard'
 
 // ── Types ─────────────────────────────────────────────────────────
 
@@ -286,6 +288,8 @@ export default function GapsAnalysis({ onToast }: Props) {
   const [showThinking, setShowThinking] = useState(false)
   const [runState,     setRunState]     = useState<RunState>('idle')
   const [accumulated,  setAccumulated]  = useState('')
+  const [findings,     setFindings]     = useState<Finding[] | null>(null)
+  const [rawContent,   setRawContent]   = useState<string>('')
   const [errorMsg,     setErrorMsg]     = useState<string | null>(null)
   const [thinkOpen,    setThinkOpen]    = useState(false)
   const resultsRef = useRef<HTMLDivElement>(null)
@@ -311,8 +315,6 @@ export default function GapsAnalysis({ onToast }: Props) {
 
   const segments    = parseSegments(accumulated)
   const thinkText   = segments.filter(s => s.type === 'thinking').map(s => s.text).join('')
-  const contentText = segments.filter(s => s.type === 'content').map(s => s.text).join('')
-  const hasContent  = contentText.trim().length > 0
   const hasThink    = thinkText.trim().length > 0
   const canRun      = (useLatest ? !!latestSession : !!selId) && runState !== 'streaming'
 
@@ -333,6 +335,8 @@ export default function GapsAnalysis({ onToast }: Props) {
 
     setRunState('streaming')
     setAccumulated('')
+    setFindings(null)
+    setRawContent('')
     setErrorMsg(null)
     setThinkOpen(true)   // expand reasoning panel as it streams in
 
@@ -380,7 +384,10 @@ export default function GapsAnalysis({ onToast }: Props) {
         for (const line of lines) {
           if (!line.trim()) continue
           try {
-            const msg = JSON.parse(line) as { type: string; text?: string; message?: string; session_id?: string }
+            const msg = JSON.parse(line) as {
+              type: string; text?: string; message?: string;
+              session_id?: string; findings?: Finding[]; raw?: string
+            }
             if (msg.type === 'token' && msg.text) {
               setAccumulated(prev => prev + msg.text)
             } else if (msg.type === 'error') {
@@ -390,6 +397,10 @@ export default function GapsAnalysis({ onToast }: Props) {
             } else if (msg.type === 'done') {
               localState = 'done'
               setRunState('done')
+              if (Array.isArray(msg.findings) && msg.findings.length > 0) {
+                setFindings(msg.findings)
+              }
+              if (msg.raw) setRawContent(msg.raw)
               const sessId = msg.session_id ?? selId ?? ''
               onToast?.('Analysis complete', `Session ${sessId.slice(0, 10)}`)
             }
@@ -402,6 +413,8 @@ export default function GapsAnalysis({ onToast }: Props) {
       if ((err as Error).name === 'AbortError') {
         setRunState('idle')
         setAccumulated('')
+        setFindings(null)
+        setRawContent('')
       } else {
         setErrorMsg(String(err))
         setRunState('error')
@@ -594,7 +607,7 @@ export default function GapsAnalysis({ onToast }: Props) {
           )}
 
           {/* Findings header */}
-          {(hasContent || runState === 'streaming') && (
+          {(findings !== null || rawContent || runState === 'streaming') && (
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
               <span style={{ fontSize: 12.5, fontWeight: 600 }}>Findings</span>
               {selectedSession && (
@@ -620,13 +633,20 @@ export default function GapsAnalysis({ onToast }: Props) {
             </div>
           )}
 
-          {/* Findings content */}
-          {(hasContent || (runState === 'streaming' && !hasThink)) && (
-            <FindingsBlock text={contentText} streaming={runState === 'streaming'} />
+          {/* Structured findings cards */}
+          {findings !== null && findings.length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {findings.map((f, i) => <FindingCard key={i} finding={f} />)}
+            </div>
           )}
 
-          {/* Streaming — showing thinking only, not content yet */}
-          {runState === 'streaming' && !hasContent && hasThink && (
+          {/* Fallback: raw text when structured parse failed */}
+          {findings === null && rawContent && runState === 'done' && (
+            <FindingsBlock text={rawContent} streaming={false} />
+          )}
+
+          {/* Streaming — LLM is reasoning, findings not yet available */}
+          {runState === 'streaming' && (
             <div style={{
               border: '1px solid rgba(255,255,255,0.07)',
               borderRadius: 10,
@@ -644,7 +664,7 @@ export default function GapsAnalysis({ onToast }: Props) {
                   <circle cx="8" cy="8" r="5.5" strokeDasharray="25" strokeDashoffset="10" />
                 </svg>
               </span>
-              reasoning through transcript and notes…
+              {hasThink ? 'reasoning through transcript and notes…' : 'analysing…'}
             </div>
           )}
 

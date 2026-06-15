@@ -40,7 +40,7 @@ from query import query_stream, search_literature                               
 from ingest import ingest_paths, extract_pdf, OCR_MIN_CHARS, get_collection    # noqa: E402
 from batch_transcribe import transcribe_file                                    # noqa: E402
 from manifest import load_manifest                                              # noqa: E402
-from gaps import gaps_stream, resolve_session_id as _resolve_session_id        # noqa: E402
+from gaps import gaps_stream, resolve_session_id as _resolve_session_id, parse_gap_findings  # noqa: E402
 
 # Phase 5B: live lecture imports (importing live_transcribe also runs the
 # Windows NVIDIA DLL PATH fix at module load time — must stay before app init)
@@ -507,8 +507,11 @@ async def ws_lecture(ws: WebSocket):
                     ws_session_start = time.time()
 
                     def on_gap(result, ts):
-                        emit({"type": "gap", "text": result,
-                              "ts": ts.isoformat() if ts else None})
+                        ts_str = ts.isoformat() if ts else None
+                        if isinstance(result, list):
+                            emit({"type": "gap", "findings": result, "ts": ts_str})
+                        else:
+                            emit({"type": "gap", "raw": result, "ts": ts_str})
 
                     gap_worker = LiveGapWorker(get_current_session, on_gap)
                     gap_worker.start()
@@ -659,38 +662,67 @@ async def run_gaps(body: _GapsRequest):
     queue: asyncio.Queue[str | None] = asyncio.Queue()
 
     def blocking_work() -> None:
-        had_error = False
+        # Separate think tokens (stream in real-time) from content tokens (buffer for JSON parse).
+        # We always call gaps_stream with show_thinking=True to receive think tags; we then
+        # decide whether to forward them based on the user's show_thinking preference.
+        pending = ""
+        in_think = False
+        content_buf = ""
+        OPEN = "<think>"
+        CLOSE = "</think>"
+
+        def enqueue(obj: dict) -> None:
+            loop.call_soon_threadsafe(queue.put_nowait, json.dumps(obj) + "\n")
+
         try:
             print(f"[GAPS] session={session_id} show_thinking={show_thinking}", flush=True)
-            for token in gaps_stream(session_id, show_thinking):
-                if token:
-                    loop.call_soon_threadsafe(
-                        queue.put_nowait,
-                        json.dumps({"type": "token", "text": token}) + "\n",
-                    )
+            for token in gaps_stream(session_id, show_thinking=True):
+                pending += token
+                while pending:
+                    if not in_think:
+                        idx = pending.find(OPEN)
+                        if idx == -1:
+                            safe = max(0, len(pending) - len(OPEN) + 1)
+                            content_buf += pending[:safe]
+                            pending = pending[safe:]
+                            break
+                        content_buf += pending[:idx]
+                        pending = pending[idx + len(OPEN):]
+                        if show_thinking:
+                            enqueue({"type": "token", "text": OPEN})
+                        in_think = True
+                    else:
+                        idx = pending.find(CLOSE)
+                        if idx == -1:
+                            safe = max(0, len(pending) - len(CLOSE) + 1)
+                            if show_thinking and safe > 0:
+                                enqueue({"type": "token", "text": pending[:safe]})
+                            pending = pending[safe:]
+                            break
+                        if show_thinking:
+                            enqueue({"type": "token", "text": pending[:idx] + CLOSE})
+                        pending = pending[idx + len(CLOSE):]
+                        in_think = False
+
+            if pending:
+                content_buf += pending
+
+            findings = parse_gap_findings(content_buf)
+            enqueue({
+                "type": "done",
+                "session_id": session_id,
+                "findings": findings if findings is not None else [],
+                "raw": content_buf,
+            })
         except SystemExit:
             # gaps.py calls sys.exit(1) when transcript file is missing;
             # in a non-main thread this only kills the thread, not the process.
-            had_error = True
-            loop.call_soon_threadsafe(
-                queue.put_nowait,
-                json.dumps({"type": "error",
-                            "message": "Transcript file not found for this session."}) + "\n",
-            )
+            enqueue({"type": "error", "message": "Transcript file not found for this session."})
         except Exception as exc:
             import traceback
             print(f"[GAPS] Error:\n{traceback.format_exc()}", flush=True)
-            had_error = True
-            loop.call_soon_threadsafe(
-                queue.put_nowait,
-                json.dumps({"type": "error", "message": str(exc)}) + "\n",
-            )
+            enqueue({"type": "error", "message": str(exc)})
         finally:
-            if not had_error:
-                loop.call_soon_threadsafe(
-                    queue.put_nowait,
-                    json.dumps({"type": "done", "session_id": session_id}) + "\n",
-                )
             loop.call_soon_threadsafe(queue.put_nowait, None)  # sentinel
 
     async def generate():

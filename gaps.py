@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import json
 import re
 import sys
 import time
@@ -31,6 +32,28 @@ EMBED_MAX_WORDS = 1500
 
 THINK_OPEN = "<think>"
 THINK_CLOSE = "</think>"
+
+
+def parse_gap_findings(text: str) -> "list[dict] | None":
+    """Extract first JSON array from text. Tolerates code fences and leading prose."""
+    cleaned = re.sub(r'```(?:json)?\s*', '', text).replace('```', '')
+    start = cleaned.find('[')
+    if start == -1:
+        return None
+    depth = 0
+    for i, ch in enumerate(cleaned[start:], start):
+        if ch == '[':
+            depth += 1
+        elif ch == ']':
+            depth -= 1
+            if depth == 0:
+                try:
+                    data = json.loads(cleaned[start:i + 1])
+                    if isinstance(data, list) and data:
+                        return data
+                except json.JSONDecodeError:
+                    return None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -232,13 +255,19 @@ def gaps_stream(session_id: str, show_thinking: bool = False) -> Iterator[str]:
         f"notes and slides for the same topic.\n\n{doc_scope}"
         f"LECTURE TRANSCRIPT:\n{transcript}\n\n"
         f"PLANNED NOTES AND SLIDES:\n{chunks_text}\n\n"
-        "Compare them carefully. Identify specific topics, concepts, "
-        "definitions, or examples that appear in the planned notes/slides "
-        "but were NOT covered or were only briefly mentioned in the lecture. "
-        "Be specific. Quote the relevant note/slide text. If everything in "
-        "the notes was covered, say so plainly.\n\n"
-        "Format your response as a bulleted list of gaps, each with the "
-        "source file it came from."
+        "Compare them carefully. For EVERY major topic, concept, or definition in "
+        "the notes/slides, determine whether the lecture covered it.\n\n"
+        "Return your answer as a JSON array. Each element must have exactly these keys:\n"
+        '  "topic"  - short topic name (string)\n'
+        '  "status" - one of: "covered", "partial", or "uncovered"\n'
+        '  "note"   - one sentence explaining the status; quote relevant source text if uncovered (string)\n'
+        '  "source" - the source filename from the chunk header (string)\n\n'
+        "Return ONLY the JSON array, no prose before or after it. Example:\n"
+        '[{"topic":"Resting membrane potential","status":"covered",'
+        '"note":"Lecturer explained -70 mV resting potential in detail.",'
+        '"source":"lecture1.pdf"}]\n'
+        "If everything was covered, still return the full JSON array with "
+        'status="covered" for each item.'
     )
     t0 = time.time()
     for token in _think_filter([{"role": "user", "content": prompt}], show_thinking):

@@ -11,6 +11,8 @@ from typing import Callable, Iterator
 import chromadb
 import ollama
 
+from gaps import parse_gap_findings
+
 CHROMA_DIR = Path("chroma_db")
 COLLECTION_NAME = "course_material"
 EMBED_MODEL = "nomic-embed-text"
@@ -75,8 +77,13 @@ def live_gaps_stream(transcript: str, linked_docs: list[str]) -> Iterator[str]:
         f"{doc_scope}"
         f"RECENT LECTURE CONTENT:\n{transcript}\n\n"
         f"NOTES/SLIDES:\n{chunks}\n\n"
-        "List topics from the notes/slides NOT covered in this recent section. "
-        "Bullet points only. If everything covered, say so."
+        "For each major topic in the notes/slides, determine if it was covered in the "
+        "recent lecture content. Return a JSON array. Each item must have these keys:\n"
+        '  "topic"  - short topic name\n'
+        '  "status" - "covered", "partial", or "uncovered"\n'
+        '  "note"   - one sentence (be brief)\n'
+        '  "source" - the source filename from the chunk header\n\n'
+        "Return ONLY the JSON array, no other text."
     )
     for chunk in ollama.chat(
         model=LLM_MODEL,
@@ -149,4 +156,5 @@ class LiveGapWorker:
             result = f"⚠ {e}"
         print(f"[GAP-LIVE] llm {time.time() - t0:.1f}s", flush=True)
         session.latest_gap_analysis = result
-        self._on_result(result, datetime.now())
+        findings = parse_gap_findings(result)
+        self._on_result(findings if findings is not None else result, datetime.now())

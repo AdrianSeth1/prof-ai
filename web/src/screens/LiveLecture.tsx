@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import SourceFilter from '../components/SourceFilter'
 import type { SourceData } from '../components/SourceFilter'
+import FindingCard from '../components/FindingCard'
+import type { Finding } from '../components/FindingCard'
 
 interface Props {
   onToast: (title: string, desc?: string) => void
@@ -38,8 +40,22 @@ class AudioProc extends AudioWorkletProcessor {
     this._SIL_FRAMES = 35; // 35 x 20ms = 700ms silence -> flush
 
     this.port.onmessage = (ev) => {
-      if (ev.data.type === 'set_threshold')
-        this._threshold = ev.data.value;
+      const d = ev.data;
+      if (d.type === 'set_threshold') {
+        this._threshold = d.value;
+      } else if (d.type === 'force_flush') {
+        // Drain any partial buffer immediately and signal flush
+        if (this._buf.length > 0) {
+          const rem = this._buf.splice(0);
+          const i16 = new Int16Array(rem.length);
+          for (let j = 0; j < rem.length; j++)
+            i16[j] = Math.max(-32768, Math.min(32767, (rem[j] * 32767) | 0));
+          this.port.postMessage({ type: 'audio', buf: i16.buffer }, [i16.buffer]);
+        }
+        this._hasSpeech = false;
+        this._silCount  = 0;
+        this.port.postMessage({ type: 'flush' });
+      }
     };
   }
 
@@ -120,6 +136,10 @@ export default function LiveLecture({ onToast }: Props) {
   const txEndRef       = useRef<HTMLDivElement | null>(null)
   const levelBarRef    = useRef<HTMLDivElement | null>(null)
   const curQuestionRef = useRef<string>('')
+  // Question-capture robustness refs
+  const ambientRmsRef  = useRef<number>(0.012)   // rolling EMA of mic RMS (α=0.005)
+  const qaTimeoutRef   = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const uiModeRef      = useRef<UIMode>('lecture') // mirrors uiMode for use in callbacks
 
   // React state
   const [sessionInfo, setSessionInfo]         = useState<SessionInfo | null>(null)
@@ -128,7 +148,8 @@ export default function LiveLecture({ onToast }: Props) {
   const [currentAnswer, setCurrentAnswer]     = useState<QAEntry | null>(null)
   const [currentQuestion, setCurrentQuestion] = useState<string>('')
   const [qaHistory, setQaHistory]             = useState<QAEntry[]>([])
-  const [gapText, setGapText]                 = useState<string>('')
+  const [gapFindings, setGapFindings]         = useState<Finding[] | null>(null)
+  const [gapRaw, setGapRaw]                   = useState<string | null>(null)
   const [gapTs, setGapTs]                     = useState<string | null>(null)
   const [sessionName, setSessionName]         = useState<string>('')
   const [selection, setSelection]             = useState<Set<string>>(new Set())
@@ -155,6 +176,23 @@ export default function LiveLecture({ onToast }: Props) {
       return next
     })
   }, [])
+
+  // Keep uiModeRef in sync (used in worklet message handler and timeout callbacks)
+  useEffect(() => {
+    uiModeRef.current = uiMode
+  }, [uiMode])
+
+  // 20s auto-flush timeout when in AWAITING mode
+  useEffect(() => {
+    if (uiMode !== 'awaiting') return
+    const t = setTimeout(() => {
+      if (uiModeRef.current === 'awaiting') {
+        workletRef.current?.port.postMessage({ type: 'force_flush' })
+      }
+    }, 20000)
+    qaTimeoutRef.current = t
+    return () => clearTimeout(t)
+  }, [uiMode])
 
   // Auto-scroll transcript pane when new segments arrive
   useEffect(() => {
@@ -224,7 +262,13 @@ export default function LiveLecture({ onToast }: Props) {
       setQaHistory(prev => [...prev, entry])
 
     } else if (type === 'gap') {
-      setGapText((msg.text as string) || '')
+      if (Array.isArray(msg.findings)) {
+        setGapFindings(msg.findings as Finding[])
+        setGapRaw(null)
+      } else {
+        setGapFindings(null)
+        setGapRaw((msg.raw as string) || (msg.text as string) || '')
+      }
       setGapTs((msg.ts as string | null) ?? null)
 
     } else if (type === 'stopped') {
@@ -234,7 +278,8 @@ export default function LiveLecture({ onToast }: Props) {
       setCurrentAnswer(null)
       setCurrentQuestion('')
       setQaHistory([])
-      setGapText('')
+      setGapFindings(null)
+      setGapRaw(null)
       setGapTs(null)
       setUiMode('lecture')
       onToast('Session ended')
@@ -318,6 +363,9 @@ export default function LiveLecture({ onToast }: Props) {
             if (levelBarRef.current) {
               levelBarRef.current.style.width = `${Math.min(100, m.rms * 3500)}%`
             }
+            // Track ambient noise level: slow EMA (α=0.005) regardless of mode
+            // In practice converges to background+voice average, good enough for threshold calibration
+            ambientRmsRef.current = 0.995 * ambientRmsRef.current + 0.005 * m.rms
           }
         }
 
@@ -333,13 +381,31 @@ export default function LiveLecture({ onToast }: Props) {
   }, [sessionName, selection, handleWsMessage, onToast])
 
   // ── Controls ────────────────────────────────────────────────────
+  const _restoreThreshold = useCallback(() => {
+    workletRef.current?.port.postMessage({ type: 'set_threshold', value: threshold })
+  }, [threshold])
+
   const askAI = useCallback(() => {
+    // Raise silence gate above ambient noise so end-of-question can be detected
+    // in noisy rooms. ambient * 1.3 is above floor noise but below speech level.
+    const adapted = Math.max(threshold, ambientRmsRef.current * 1.3)
+    if (adapted > threshold) {
+      workletRef.current?.port.postMessage({ type: 'set_threshold', value: adapted })
+    }
     wsRef.current?.send(JSON.stringify({ type: 'ask_ai' }))
-  }, [])
+  }, [threshold])
+
+  const doneSpeaking = useCallback(() => {
+    if (qaTimeoutRef.current) { clearTimeout(qaTimeoutRef.current); qaTimeoutRef.current = null }
+    _restoreThreshold()
+    workletRef.current?.port.postMessage({ type: 'force_flush' })
+  }, [_restoreThreshold])
 
   const cancelAsk = useCallback(() => {
+    if (qaTimeoutRef.current) { clearTimeout(qaTimeoutRef.current); qaTimeoutRef.current = null }
+    _restoreThreshold()
     wsRef.current?.send(JSON.stringify({ type: 'cancel' }))
-  }, [])
+  }, [_restoreThreshold])
 
   const togglePause = useCallback(() => {
     wsRef.current?.send(JSON.stringify({ type: uiMode === 'paused' ? 'resume_mic' : 'pause_mic' }))
@@ -548,13 +614,26 @@ export default function LiveLecture({ onToast }: Props) {
               margin: 12, padding: 16,
               background: 'rgba(233,162,59,0.08)',
               border: '1px solid rgba(233,162,59,0.3)', borderRadius: 8,
+              display: 'flex', flexDirection: 'column', gap: 10,
             }}>
-              <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--await)', marginBottom: 4 }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--await)' }}>
                 ◎ Speak your question
               </div>
               <div style={{ fontSize: 11, color: 'var(--fg-muted)' }}>
-                700 ms of silence closes the buffer and triggers RAG.
+                Press <strong style={{ color: 'var(--text)' }}>Done speaking</strong> when finished,
+                or wait for 700 ms of silence. Auto-flushes after 20 s.
               </div>
+              <button
+                onClick={doneSpeaking}
+                style={{
+                  alignSelf: 'flex-start',
+                  background: 'var(--await)', color: '#fff',
+                  border: 'none', borderRadius: 6, padding: '6px 14px',
+                  fontSize: 12, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit',
+                }}
+              >
+                ✓ Done speaking
+              </button>
             </div>
           )}
 
@@ -653,13 +732,21 @@ export default function LiveLecture({ onToast }: Props) {
             {gapsOpen && (
               <div style={{
                 padding: '10px 14px', borderTop: '1px solid var(--border)',
-                background: 'var(--bg-base)',
-                fontSize: 11.5, lineHeight: 1.7, color: 'var(--fg-muted)',
-                maxHeight: 140, overflowY: 'auto',
-                fontFamily: "'JetBrains Mono',monospace", whiteSpace: 'pre-wrap',
+                maxHeight: 200, overflowY: 'auto',
               }}>
-                {gapText || (
-                  <span style={{ fontStyle: 'italic' }}>
+                {gapFindings ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    {gapFindings.map((f, i) => <FindingCard key={i} finding={f} />)}
+                  </div>
+                ) : gapRaw ? (
+                  <div style={{
+                    fontSize: 11.5, lineHeight: 1.7, color: 'var(--fg-muted)',
+                    fontFamily: "'JetBrains Mono',monospace", whiteSpace: 'pre-wrap',
+                  }}>
+                    {gapRaw}
+                  </div>
+                ) : (
+                  <span style={{ fontSize: 11.5, fontStyle: 'italic', color: 'var(--fg-muted)' }}>
                     Gap analysis runs every 60 s after 50+ words are spoken.
                   </span>
                 )}
@@ -747,17 +834,30 @@ export default function LiveLecture({ onToast }: Props) {
         </button>
 
         {uiMode === 'awaiting' && (
-          <button
-            onClick={cancelAsk}
-            style={{
-              background: 'rgba(239,77,86,0.10)',
-              border: '1px solid rgba(239,77,86,0.3)', borderRadius: 6,
-              padding: '6px 14px', color: 'var(--rec)',
-              fontSize: 12, cursor: 'pointer', fontFamily: 'inherit',
-            }}
-          >
-            Cancel
-          </button>
+          <>
+            <button
+              onClick={doneSpeaking}
+              style={{
+                background: 'var(--await)', color: '#fff',
+                border: 'none', borderRadius: 6,
+                padding: '6px 14px',
+                fontSize: 12, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit',
+              }}
+            >
+              ✓ Done speaking
+            </button>
+            <button
+              onClick={cancelAsk}
+              style={{
+                background: 'rgba(239,77,86,0.10)',
+                border: '1px solid rgba(239,77,86,0.3)', borderRadius: 6,
+                padding: '6px 14px', color: 'var(--rec)',
+                fontSize: 12, cursor: 'pointer', fontFamily: 'inherit',
+              }}
+            >
+              Cancel
+            </button>
+          </>
         )}
 
         <button
