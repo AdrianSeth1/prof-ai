@@ -8,6 +8,7 @@ This document is written for a future AI session (Claude Code or Claude web) wit
 
 | Date | Summary |
 |---|---|
+| 2026-06-15 | Phase 5B — Live Lecture screen wired in new React/FastAPI app. `api/main.py`: added `/ws/lecture` WebSocket endpoint with full mode state machine (LECTURE/AWAITING_QUESTION/PROCESSING + speaking/paused derived at WS layer), asyncio lifespan for Whisper+TTS pre-warming, asyncio.Queue drain task to bridge bg-thread QA handler to WS, LiveGapWorker integration, `answer_question`/`answer_conversation_turn` dispatch on `session.in_conversation`, TTS WAV sent as binary WS frames. `web/src/screens/LiveLecture.tsx`: full screen replacing placeholder — pre-start panel (name, doc picker), AudioWorklet blob URL capture (48kHz→16kHz, RMS gate, 700ms flush), state bar (5 visual states, color-coded), transcript pane (JetBrains Mono 13.5px), answer card with citation chips, live gaps panel, Q&A history, control bar with Ask AI/Pause/Cancel/Conv mode/gate slider. `web/src/App.tsx`: passes `onToast` to `<LiveLecture />`. `npm run build` clean — 0 TypeScript errors. Gradio `app.py` unchanged. |
 | 2026-06-12 | Whisper fixes after first SPEC 2 field test. (1) `temperature=0.0` caused an un-escapable repetition loop ("university university ..." for a full segment) because temperature retries are also Whisper's escape hatch for repetition. Changed to `temperature=[0.0, 0.2, 0.4]` in live_transcribe.py and batch_transcribe.py — keeps loop escape, still avoids the high-temperature fabrication zone. (2) Vocab term filtering in `build_whisper_prompt()`: drops terms under 3 chars, bare numbers/dates, and duplicates before classification, because the 14b extractor shredded a doc title into junk tokens ("September", "30", "2014") that polluted the initial prompt. |
 | 2026-06-12 | Modules drag panel keeps selection across re-renders. app.py `_render_drag_panel()` JS: selection (class + module) is persisted to localStorage in `__pmaSelClass` / `__pmaSel` via new `saveSel()`, and the init IIFE restores it on every panel rebuild instead of always selecting the first class/module. Restore prefers the stored module and locates whichever class currently contains it. Fixes: adding several documents to one module bounced the user back to Unassigned after every drop. |
 | 2026-06-12 | SPEC 2 implemented (commit 5bdba9b, via aider + qwen3.6:27b, reviewed and patched by Claude). live_transcribe.py and batch_transcribe.py: `vad_filter=True` with `min_silence_duration_ms=250`, `temperature=0.0` (disables the fallback chain), and a `HALLUCINATION_PHRASES` filter that drops segments matching a known-hallucination phrase AND `no_speech_prob > 0.3`, logged with `[Whisper]` prefix. Vocab extraction: `/no_think` prompt prefix removed, replaced with `think=False`. NOTE: qwen originally wrote `options={"think": False}`, which Ollama silently ignores — corrected to the top-level `think=False` kwarg. Section 3 tables and section 5 open issues updated accordingly. |
@@ -299,6 +300,81 @@ gaps.py and live_gap.py changed from `qwen3:30b-a3b` to `qwen3:14b`.
 1. Hallucination spam ("Thank you for watching"): raised `no_speech_threshold` to 0.7, added `log_prob_threshold=-0.8`
 2. Short-word mistranscriptions: raised `VAD_SILENCE_MS` to 600ms in recorder.py
 3. Prompt echoing in transcripts: reformatted `build_whisper_prompt` from comma list to sentence prose
+
+---
+
+## 4b. New React/FastAPI app (parallel to Gradio, in `web/` and `api/`)
+
+A full replacement UI is being built alongside the Gradio app. Both can run simultaneously: Gradio on port 7860, FastAPI on port 8000. The new app serves the built Vite SPA from `web/dist/` and exposes a REST + WebSocket API.
+
+### Stack
+- **Frontend**: Vite + React 18 + TypeScript + Tailwind v3, in `web/src/`
+- **Backend**: FastAPI in `api/main.py`, port 8000
+- **Build**: `cd web && npm run build` → `web/dist/`
+- **Dev**: `npm run dev` in `web/` (Vite dev server on 5173), `python -m uvicorn api.main:app --port 8000` separately
+- **Run prod**: `python api/main.py` (serves the built Vite dist)
+
+### Phases completed (commits 0cb1dff, b9f1799, 283abee)
+- **Phase 0**: App shell, sidebar, command palette, toast system, FastAPI skeleton
+- **Phase 1**: Chat screen — RAG + literature streaming NDJSON
+- **Phase 2**: Add Materials — multipart ingest, NDJSON progress
+- **Phase 3**: Modules — dnd-kit 4-column drag board
+- **Phase 4**: Gaps Analysis — session selector, gaps_stream NDJSON
+- **Phase 5A**: Standalone audio spike at `spike/` (port 8100) — proves Whisper+TTS transport
+- **Phase 5B**: Live Lecture screen fully wired — see change log entry 2026-06-15
+
+### `/ws/lecture` WebSocket protocol (api/main.py)
+```
+Client → Server (text JSON):
+  {type:"start", name:"...", linked_documents:[...]}
+  {type:"flush"}
+  {type:"ask_ai"}
+  {type:"cancel"}
+  {type:"pause_mic"}
+  {type:"resume_mic"}
+  {type:"set_conversation_mode", enabled:true|false}
+  {type:"stop"}
+Client → Server (binary):
+  Int16 PCM frames (20ms chunks, 16kHz equivalent after 48→16kHz decimation)
+
+Server → Client (text JSON):
+  {type:"started", session_id:"...", name:"..."}
+  {type:"state", mode:"lecture"|"awaiting"|"processing"|"speaking"|"paused"}
+  {type:"transcript", text:"...", confidence:0.95, ms:120}
+  {type:"question", text:"..."}
+  {type:"answer", text:"...", sources:[...], reasoning:"..."}
+  {type:"tts_start"}
+  {type:"tts_end"}
+  {type:"gap", text:"...", ts:"2026-06-15T..."}
+  {type:"stopped"}
+  {type:"error", message:"..."}
+Server → Client (binary):
+  WAV bytes (Piper libritts-high, 22050 Hz mono 16-bit)
+```
+
+### Key design decisions
+- **No push_audio()**: `push_audio()` returns None — can't get transcript text. WS handler calls `transcribe_audio()` + `session.append_segment()` directly, same filtering as `process_utterance()` (`_MIN_WORDS=2`, `_MIN_LOGPROB=-1.0`).
+- **QA handler bridge**: QA runs in bg thread, bridges to WS via `asyncio.Queue` + `loop.call_soon_threadsafe`, drained by an async task. Same pattern as NDJSON streaming in `/api/chat`.
+- **TTS**: `PiperTTS.synthesize(answer)` → WAV bytes sent as WS binary frame, played via Web Audio API queued playback (`playTime` cursor).
+- **5 UI states from 3 backend modes**: `speaking` = between `tts_start` and `tts_end`; `paused` = client sent `pause_mic`. Backend modes are `LECTURE/AWAITING_QUESTION/PROCESSING`.
+- **Conversation mode**: `session.in_conversation` toggled via `set_conversation_mode` message; dispatches `answer_conversation_turn` instead of `answer_question`. Frontend appends to `session.conversation_history` after each turn.
+- **Level meter**: Updated via direct DOM ref mutation (not React state) to avoid 50Hz re-renders.
+- **Startup pre-warming**: Whisper and TTS pre-loaded in asyncio lifespan before accepting connections. ~30-60s startup time.
+
+### New app run instructions
+```powershell
+cd C:\prof-ai
+.\venv\Scripts\Activate.ps1
+python api\main.py
+```
+Then open `http://127.0.0.1:8000` in a browser. Startup log shows:
+```
+[STARTUP] pre-warming Whisper (large-v3-turbo · CUDA float16)…
+[STARTUP] Whisper ready
+[STARTUP] pre-warming Piper TTS…
+[STARTUP] TTS ready — sample_rate=22050 Hz
+[STARTUP] Serving static build from ...\web\dist
+```
 
 ---
 
