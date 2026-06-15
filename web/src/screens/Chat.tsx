@@ -1,9 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import SourceFilter from '../components/SourceFilter'
+import type { SourceData } from '../components/SourceFilter'
 
 // ── Local types ───────────────────────────────────────────────────
-
-interface Module { id: string; name: string }
-interface SourceData { modules: Module[]; documents: string[] }
 
 interface SourceDetail { source_file: string; location: string; preview: string }
 interface LitItem {
@@ -196,48 +195,6 @@ function MsgRow({ msg }: { msg: ChatMsg }) {
   )
 }
 
-// ── Checkbox row ──────────────────────────────────────────────────
-
-function CheckRow({
-  checked, label, mono, onClick,
-}: { checked: boolean; label: string; mono?: boolean; onClick: () => void }) {
-  const [hov, setHov] = useState(false)
-  return (
-    <div
-      onClick={onClick}
-      onMouseEnter={() => setHov(true)}
-      onMouseLeave={() => setHov(false)}
-      style={{
-        display: 'flex', alignItems: 'center', gap: 9,
-        padding: '7px 8px', borderRadius: 6,
-        cursor: 'pointer', fontSize: 12.5, color: '#c4c8cf',
-        background: hov ? 'rgba(255,255,255,0.04)' : 'transparent',
-        transition: 'background 140ms ease',
-        userSelect: 'none',
-      }}
-    >
-      <span style={{
-        width: 15, height: 15, borderRadius: 4,
-        flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
-        border: `1px solid ${checked ? 'var(--accent)' : 'rgba(255,255,255,0.2)'}`,
-        background: checked ? 'var(--accent)' : 'transparent',
-        transition: 'all 140ms ease',
-      }}>
-        {checked && (
-          <svg width="9" height="9" viewBox="0 0 16 16" fill="none"
-            stroke="#fff" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M3 8.5l3.2 3.2L13 4.5" />
-          </svg>
-        )}
-      </span>
-      <span style={mono
-        ? { fontFamily: '"JetBrains Mono",monospace', fontSize: 11 }
-        : {}
-      }>{label}</span>
-    </div>
-  )
-}
-
 // ── Literature toggle ─────────────────────────────────────────────
 
 function LitToggle({ label, active, onClick }: { label: string; active: boolean; onClick: () => void }) {
@@ -273,7 +230,6 @@ function LitToggle({ label, active, onClick }: { label: string; active: boolean;
 export default function Chat() {
   const [sources, setSources]       = useState<SourceData>({ modules: [], documents: [] })
   const [selected, setSelected]     = useState<Set<string>>(new Set())
-  const [scopeOpen, setScopeOpen]   = useState(false)
   const [lit, setLit]               = useState({ pubmed: true, semantic_scholar: true, openalex: false })
   const [messages, setMessages]     = useState<ChatMsg[]>([])
   const [chatInput, setChatInput]   = useState('')
@@ -283,7 +239,6 @@ export default function Chat() {
 
   const threadRef   = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
-  const scopeRef    = useRef<HTMLDivElement>(null)
 
   // Load modules + documents for the filter popover
   useEffect(() => {
@@ -292,18 +247,6 @@ export default function Chat() {
       .then(d => d && setSources(d))
       .catch(() => {})
   }, [])
-
-  // Close scope popover on outside click
-  useEffect(() => {
-    if (!scopeOpen) return
-    const h = (e: MouseEvent) => {
-      if (scopeRef.current && !scopeRef.current.contains(e.target as Node)) {
-        setScopeOpen(false)
-      }
-    }
-    document.addEventListener('mousedown', h)
-    return () => document.removeEventListener('mousedown', h)
-  }, [scopeOpen])
 
   // Auto-scroll thread
   useEffect(() => {
@@ -327,11 +270,6 @@ export default function Chat() {
       return next
     })
   }, [])
-
-  const scopeCount = selected.size
-  const scopeLabel = scopeCount === 0
-    ? 'All materials'
-    : `${scopeCount} source${scopeCount !== 1 ? 's' : ''} selected`
 
   // ── Send message ────────────────────────────────────────────────
   const send = useCallback(async () => {
@@ -457,74 +395,11 @@ export default function Chat() {
         }}>
 
           {/* Scope dropdown */}
-          <div ref={scopeRef} style={{ position: 'relative' }}>
-            <ScopeTrigger
-              label={scopeLabel}
-              open={scopeOpen}
-              onClick={() => setScopeOpen(o => !o)}
-            />
-            {scopeOpen && (
-              <div
-                className="animate-fade-up"
-                style={{
-                  position: 'absolute', top: 36, left: 0, width: 320,
-                  border: '1px solid rgba(255,255,255,0.10)',
-                  borderRadius: 10,
-                  background: 'var(--surface-pop)',
-                  boxShadow: '0 12px 40px rgba(0,0,0,0.5)',
-                  padding: 7,
-                  zIndex: 20,
-                }}
-              >
-                {/* Modules group */}
-                <GroupLabel>MODULES</GroupLabel>
-                {sources.modules.length === 0 && (
-                  <div style={{ padding: '6px 8px', fontSize: 12, color: 'var(--text-faint)' }}>
-                    No modules yet
-                  </div>
-                )}
-                {sources.modules.map(m => (
-                  <CheckRow
-                    key={m.id}
-                    checked={selected.has(m.id)}
-                    label={m.name}
-                    onClick={() => toggleItem(m.id)}
-                  />
-                ))}
-
-                {/* Documents group */}
-                <div style={{
-                  borderTop: '1px solid rgba(255,255,255,0.06)',
-                  marginTop: 4, paddingTop: 4,
-                }}>
-                  <GroupLabel>DOCUMENTS</GroupLabel>
-                  {sources.documents.length === 0 && (
-                    <div style={{ padding: '6px 8px', fontSize: 12, color: 'var(--text-faint)' }}>
-                      No ingested documents
-                    </div>
-                  )}
-                  {sources.documents.map(fn => (
-                    <CheckRow
-                      key={fn}
-                      checked={selected.has(fn)}
-                      label={fn}
-                      mono
-                      onClick={() => toggleItem(fn)}
-                    />
-                  ))}
-                </div>
-
-                <div style={{
-                  fontSize: 10.5, color: 'var(--text-faint)',
-                  padding: '8px 8px 4px',
-                  borderTop: '1px solid rgba(255,255,255,0.06)',
-                  marginTop: 4,
-                }}>
-                  Empty selection searches everything.
-                </div>
-              </div>
-            )}
-          </div>
+          <SourceFilter
+            sources={sources}
+            selected={selected}
+            onToggle={toggleItem}
+          />
 
           {/* Divider */}
           <div style={{ width: 1, height: 18, background: 'rgba(255,255,255,0.08)', flexShrink: 0 }} />
@@ -613,44 +488,6 @@ export default function Chat() {
 }
 
 // ── Small sub-components ──────────────────────────────────────────
-
-function GroupLabel({ children }: { children: React.ReactNode }) {
-  return (
-    <div style={{
-      fontFamily: '"JetBrains Mono",monospace',
-      fontSize: 10, color: 'var(--text-faint)',
-      letterSpacing: '0.04em',
-      padding: '6px 8px 4px',
-    }}>{children}</div>
-  )
-}
-
-function ScopeTrigger({ label, open, onClick }: { label: string; open: boolean; onClick: () => void }) {
-  const [hov, setHov] = useState(false)
-  return (
-    <div
-      onClick={onClick}
-      onMouseEnter={() => setHov(true)}
-      onMouseLeave={() => setHov(false)}
-      style={{
-        display: 'flex', alignItems: 'center', gap: 8,
-        height: 30, padding: '0 11px', borderRadius: 8,
-        border: `1px solid ${open || hov ? 'rgba(255,255,255,0.18)' : 'rgba(255,255,255,0.10)'}`,
-        cursor: 'pointer', fontSize: 12.5, color: '#c4c8cf',
-        transition: 'border-color 140ms ease',
-        userSelect: 'none',
-      }}
-    >
-      <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4">
-        <path d="M2 4h12M4 8h8M6 12h4" />
-      </svg>
-      <span>{label}</span>
-      <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="#6b7079" strokeWidth="1.5" strokeLinecap="round">
-        <path d="M4 6l4 4 4-4" />
-      </svg>
-    </div>
-  )
-}
 
 function SendButton({ onClick, disabled }: { onClick: () => void; disabled: boolean }) {
   const [hov, setHov] = useState(false)

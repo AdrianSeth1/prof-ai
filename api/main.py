@@ -498,7 +498,9 @@ async def ws_lecture(ws: WebSocket):
                 name = (data.get("name") or "").strip()
                 if not name:
                     name = f"Lecture {datetime.now().strftime('%b %d')}"
-                linked_docs = data.get("linked_documents") or []
+                # expand_selection mirrors /api/chat: module IDs → flat filename list
+                raw_selection = data.get("selection") or []
+                linked_docs = expand_selection(raw_selection) if raw_selection else []
                 try:
                     session = start_live_session(name=name, linked_documents=linked_docs)
                     session.register_qa_handler(qa_handler)

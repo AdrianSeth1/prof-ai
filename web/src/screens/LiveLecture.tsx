@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import SourceFilter from '../components/SourceFilter'
+import type { SourceData } from '../components/SourceFilter'
 
 interface Props {
   onToast: (title: string, desc?: string) => void
@@ -129,8 +131,8 @@ export default function LiveLecture({ onToast }: Props) {
   const [gapText, setGapText]                 = useState<string>('')
   const [gapTs, setGapTs]                     = useState<string | null>(null)
   const [sessionName, setSessionName]         = useState<string>('')
-  const [linkedDocs, setLinkedDocs]           = useState<string[]>([])
-  const [availDocs, setAvailDocs]             = useState<string[]>([])
+  const [selection, setSelection]             = useState<Set<string>>(new Set())
+  const [sources, setSources]                 = useState<SourceData>({ modules: [], documents: [] })
   const [gapsOpen, setGapsOpen]               = useState<boolean>(true)
   const [historyOpen, setHistoryOpen]         = useState<boolean>(false)
   const [convMode, setConvMode]               = useState<boolean>(false)
@@ -138,12 +140,20 @@ export default function LiveLecture({ onToast }: Props) {
   const [threshold, setThreshold]             = useState<number>(0.012)
   const [showReasoning, setShowReasoning]     = useState<boolean>(false)
 
-  // Fetch available docs for the pre-start picker
+  // Fetch modules + docs for the pre-start picker
   useEffect(() => {
     fetch('/api/sources')
-      .then(r => r.json())
-      .then(d => setAvailDocs(d.documents || []))
+      .then(r => r.ok ? r.json() : null)
+      .then(d => d && setSources(d))
       .catch(() => {})
+  }, [])
+
+  const toggleItem = useCallback((id: string) => {
+    setSelection(prev => {
+      const next = new Set(prev)
+      next.has(id) ? next.delete(id) : next.add(id)
+      return next
+    })
   }, [])
 
   // Auto-scroll transcript pane when new segments arrive
@@ -280,7 +290,7 @@ export default function LiveLecture({ onToast }: Props) {
     ws.onopen = async () => {
       const name = sessionName.trim() ||
         `Lecture ${new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`
-      ws.send(JSON.stringify({ type: 'start', name, linked_documents: linkedDocs }))
+      ws.send(JSON.stringify({ type: 'start', name, selection: [...selection] }))
 
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
@@ -320,7 +330,7 @@ export default function LiveLecture({ onToast }: Props) {
         setConnecting(false)
       }
     }
-  }, [sessionName, linkedDocs, handleWsMessage, onToast])
+  }, [sessionName, selection, handleWsMessage, onToast])
 
   // ── Controls ────────────────────────────────────────────────────
   const askAI = useCallback(() => {
@@ -403,49 +413,26 @@ export default function LiveLecture({ onToast }: Props) {
             />
           </div>
 
-          {availDocs.length > 0 && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-              <label style={{
-                fontSize: 10, fontWeight: 700, letterSpacing: '0.08em',
-                textTransform: 'uppercase', color: 'var(--fg-muted)',
-              }}>
-                Link documents ({linkedDocs.length} selected)
-              </label>
-              <div style={{
-                maxHeight: 180, overflowY: 'auto',
-                border: '1px solid var(--border)', borderRadius: 6,
-                background: 'var(--bg-base)',
-              }}>
-                {availDocs.map((doc, i) => (
-                  <label key={doc} style={{
-                    display: 'flex', alignItems: 'center', gap: 10,
-                    padding: '7px 12px', cursor: 'pointer', userSelect: 'none',
-                    borderTop: i > 0 ? '1px solid var(--border)' : undefined,
-                    fontSize: 12, color: 'var(--fg-base)',
-                  }}>
-                    <input
-                      type="checkbox"
-                      checked={linkedDocs.includes(doc)}
-                      onChange={e => {
-                        if (e.target.checked) setLinkedDocs(prev => [...prev, doc])
-                        else setLinkedDocs(prev => prev.filter(d => d !== doc))
-                      }}
-                      style={{ accentColor: 'var(--accent)', flexShrink: 0 }}
-                    />
-                    <span style={{ fontFamily: "'JetBrains Mono','Courier New',monospace", fontSize: 11 }}>
-                      {doc}
-                    </span>
-                  </label>
-                ))}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <label style={{
+              fontSize: 10, fontWeight: 700, letterSpacing: '0.08em',
+              textTransform: 'uppercase', color: 'var(--fg-muted)',
+            }}>
+              Link materials
+            </label>
+            <SourceFilter
+              sources={sources}
+              selected={selection}
+              onToggle={toggleItem}
+              emptyLabel="No materials linked"
+              note="No selection = transcript only (no RAG)."
+            />
+            {sources.modules.length === 0 && sources.documents.length === 0 && (
+              <div style={{ fontSize: 11, color: 'var(--fg-muted)', fontStyle: 'italic' }}>
+                No documents ingested yet — gaps analysis and RAG Q&amp;A will be unavailable.
               </div>
-            </div>
-          )}
-
-          {availDocs.length === 0 && (
-            <div style={{ fontSize: 11, color: 'var(--fg-muted)', fontStyle: 'italic' }}>
-              No documents ingested yet — gaps analysis and RAG Q&amp;A will be unavailable.
-            </div>
-          )}
+            )}
+          </div>
 
           <button
             onClick={startSession}
