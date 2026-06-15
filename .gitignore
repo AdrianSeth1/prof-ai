@@ -10,3 +10,9 @@ models/
 sessions.json
 manifest.json
 .aider*
+*.log
+.claude/
+
+web/node_modules/
+web/dist/
+api/__pycache__/
