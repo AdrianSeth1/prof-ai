@@ -1,0 +1,720 @@
+import { useCallback, useEffect, useRef, useState } from 'react'
+
+// ── Local types ───────────────────────────────────────────────────
+
+interface Module { id: string; name: string }
+interface SourceData { modules: Module[]; documents: string[] }
+
+interface SourceDetail { source_file: string; location: string; preview: string }
+interface LitItem {
+  source: 'pubmed' | 'semantic_scholar' | 'openalex'
+  pmid?: string
+  id?: string
+  title?: string
+}
+
+interface Chip {
+  kind: 'Doc' | 'PubMed' | 'Semantic Scholar' | 'OpenAlex'
+  label: string
+  url?: string
+  internal: boolean
+}
+
+type MsgKind = 'user' | 'thinking' | 'streaming' | 'answer' | 'error'
+
+interface ChatMsg {
+  id: string
+  role: 'user' | 'assistant'
+  kind: MsgKind
+  text: string
+  time: string
+  chips?: Chip[]
+}
+
+interface HistoryEntry { role: 'user' | 'assistant'; content: string }
+
+// ── Helpers ───────────────────────────────────────────────────────
+
+function stamp(): string {
+  return new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+}
+
+function uid(): string { return Math.random().toString(36).slice(2, 10) }
+
+function buildChips(details: SourceDetail[], literature: LitItem[]): Chip[] {
+  const chips: Chip[] = []
+  const seen = new Set<string>()
+  for (const d of details) {
+    if (!seen.has(d.source_file)) {
+      seen.add(d.source_file)
+      chips.push({ kind: 'Doc', label: d.source_file, internal: true })
+    }
+  }
+  for (const a of literature) {
+    if (a.source === 'pubmed' && a.pmid) {
+      chips.push({
+        kind: 'PubMed', label: a.pmid, internal: false,
+        url: `https://pubmed.ncbi.nlm.nih.gov/${a.pmid}/`,
+      })
+    } else if (a.source === 'semantic_scholar' && a.id) {
+      chips.push({
+        kind: 'Semantic Scholar', label: a.id, internal: false,
+        url: `https://www.semanticscholar.org/paper/${a.id}`,
+      })
+    } else if (a.source === 'openalex' && a.id) {
+      chips.push({
+        kind: 'OpenAlex', label: a.id, internal: false,
+        url: `https://openalex.org/${a.id}`,
+      })
+    }
+  }
+  return chips
+}
+
+function historyFrom(msgs: ChatMsg[]): HistoryEntry[] {
+  return msgs
+    .filter(m => m.kind === 'user' || m.kind === 'answer')
+    .slice(-12)
+    .map(m => ({ role: m.role as 'user' | 'assistant', content: m.text }))
+}
+
+// ── Citation chip ─────────────────────────────────────────────────
+
+function CitationChip({ chip }: { chip: Chip }) {
+  const [hov, setHov] = useState(false)
+  const go = () => {
+    if (chip.url) window.open(chip.url, '_blank', 'noopener,noreferrer')
+  }
+  return (
+    <span
+      onClick={go}
+      onMouseEnter={() => setHov(true)}
+      onMouseLeave={() => setHov(false)}
+      style={{
+        display: 'inline-flex', alignItems: 'center', gap: 6,
+        padding: '1px 8px',
+        border: `1px solid ${hov ? 'rgba(94,106,210,0.4)' : 'rgba(255,255,255,0.10)'}`,
+        borderRadius: 6,
+        background: hov ? '#181a1f' : 'var(--surface-pop)',
+        fontFamily: '"JetBrains Mono", monospace', fontSize: 10.5,
+        color: '#b9bcc4',
+        cursor: chip.url ? 'pointer' : 'default',
+        verticalAlign: 'middle',
+        transition: 'border-color 140ms ease, background 140ms ease',
+        flexShrink: 0,
+        userSelect: 'none',
+      }}
+    >
+      {chip.internal
+        ? <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--accent)', flexShrink: 0 }} />
+        : <span style={{ width: 6, height: 6, borderRadius: '50%', border: '1px solid rgba(255,255,255,0.3)', flexShrink: 0 }} />
+      }
+      <span style={{ color: '#6b7079' }}>{chip.kind}</span>
+      {chip.label}
+    </span>
+  )
+}
+
+// ── Skeleton shimmer ──────────────────────────────────────────────
+
+function ShimmerLine({ w }: { w: string }) {
+  return (
+    <div className="animate-shimmer" style={{ height: 11, width: w, borderRadius: 5 }} />
+  )
+}
+
+// ── Message row ───────────────────────────────────────────────────
+
+function MsgRow({ msg }: { msg: ChatMsg }) {
+  const isUser = msg.role === 'user'
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
+      {/* Header */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        {isUser
+          ? (
+            <div style={{
+              width: 22, height: 22, borderRadius: 6,
+              background: '#22242a',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: 11, fontWeight: 600, color: '#c4c8cf', flexShrink: 0,
+            }}>P</div>
+          ) : (
+            <div style={{
+              width: 22, height: 22, borderRadius: 6,
+              background: 'linear-gradient(150deg,#6e79e0,#5059bd)',
+              flexShrink: 0,
+              boxShadow: '0 0 0 1px rgba(255,255,255,0.06) inset',
+            }} />
+          )
+        }
+        <span style={{ fontSize: 12.5, fontWeight: 600 }}>{isUser ? 'You' : 'Prof AI'}</span>
+        <span style={{ fontFamily: '"JetBrains Mono",monospace', fontSize: 10.5, color: 'var(--text-faint)' }}>
+          {msg.time}
+        </span>
+      </div>
+
+      {/* Body */}
+      <div style={{ paddingLeft: 30 }}>
+        {msg.kind === 'user' && (
+          <div style={{ fontSize: 14, color: 'var(--text-body)', lineHeight: 1.6 }}>{msg.text}</div>
+        )}
+
+        {msg.kind === 'thinking' && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <ShimmerLine w="92%" />
+            <ShimmerLine w="78%" />
+            <ShimmerLine w="40%" />
+          </div>
+        )}
+
+        {(msg.kind === 'streaming' || msg.kind === 'answer') && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 13 }}>
+            <div style={{ fontSize: 14, color: 'var(--text-body)', lineHeight: 1.68, whiteSpace: 'pre-wrap' }}>
+              {msg.text}
+            </div>
+            {msg.kind === 'answer' && msg.chips && msg.chips.length > 0 && (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, alignItems: 'center' }}>
+                {msg.chips.map((c, i) => <CitationChip key={i} chip={c} />)}
+              </div>
+            )}
+          </div>
+        )}
+
+        {msg.kind === 'error' && (
+          <div style={{
+            fontSize: 13, color: 'var(--rec-text)', lineHeight: 1.5,
+            padding: '9px 12px',
+            border: '1px solid var(--rec-line)', borderRadius: 8,
+            background: 'var(--rec-08)',
+          }}>
+            {msg.text}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ── Checkbox row ──────────────────────────────────────────────────
+
+function CheckRow({
+  checked, label, mono, onClick,
+}: { checked: boolean; label: string; mono?: boolean; onClick: () => void }) {
+  const [hov, setHov] = useState(false)
+  return (
+    <div
+      onClick={onClick}
+      onMouseEnter={() => setHov(true)}
+      onMouseLeave={() => setHov(false)}
+      style={{
+        display: 'flex', alignItems: 'center', gap: 9,
+        padding: '7px 8px', borderRadius: 6,
+        cursor: 'pointer', fontSize: 12.5, color: '#c4c8cf',
+        background: hov ? 'rgba(255,255,255,0.04)' : 'transparent',
+        transition: 'background 140ms ease',
+        userSelect: 'none',
+      }}
+    >
+      <span style={{
+        width: 15, height: 15, borderRadius: 4,
+        flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
+        border: `1px solid ${checked ? 'var(--accent)' : 'rgba(255,255,255,0.2)'}`,
+        background: checked ? 'var(--accent)' : 'transparent',
+        transition: 'all 140ms ease',
+      }}>
+        {checked && (
+          <svg width="9" height="9" viewBox="0 0 16 16" fill="none"
+            stroke="#fff" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M3 8.5l3.2 3.2L13 4.5" />
+          </svg>
+        )}
+      </span>
+      <span style={mono
+        ? { fontFamily: '"JetBrains Mono",monospace', fontSize: 11 }
+        : {}
+      }>{label}</span>
+    </div>
+  )
+}
+
+// ── Literature toggle ─────────────────────────────────────────────
+
+function LitToggle({ label, active, onClick }: { label: string; active: boolean; onClick: () => void }) {
+  const [hov, setHov] = useState(false)
+  return (
+    <div
+      onClick={onClick}
+      onMouseEnter={() => setHov(true)}
+      onMouseLeave={() => setHov(false)}
+      style={{
+        display: 'inline-flex', alignItems: 'center', gap: 7,
+        height: 28, padding: '0 11px', borderRadius: 8,
+        fontSize: 12, cursor: 'pointer',
+        transition: 'all 140ms ease',
+        border: `1px solid ${active
+          ? 'rgba(94,106,210,0.5)'
+          : hov ? 'rgba(255,255,255,0.18)' : 'rgba(255,255,255,0.10)'}`,
+        background: active ? 'rgba(94,106,210,0.13)' : 'transparent',
+        color: active ? 'var(--accent-text)' : hov ? 'var(--text-soft)' : 'var(--text-muted)',
+        userSelect: 'none',
+      }}
+    >
+      {active && (
+        <span style={{ width: 5, height: 5, borderRadius: '50%', background: 'var(--accent)', flexShrink: 0 }} />
+      )}
+      {label}
+    </div>
+  )
+}
+
+// ── Main Chat screen ──────────────────────────────────────────────
+
+export default function Chat() {
+  const [sources, setSources]       = useState<SourceData>({ modules: [], documents: [] })
+  const [selected, setSelected]     = useState<Set<string>>(new Set())
+  const [scopeOpen, setScopeOpen]   = useState(false)
+  const [lit, setLit]               = useState({ pubmed: true, semantic_scholar: true, openalex: false })
+  const [messages, setMessages]     = useState<ChatMsg[]>([])
+  const [chatInput, setChatInput]   = useState('')
+  const [streaming, setStreaming]   = useState(false)
+  const [chunkCount, setChunkCount] = useState<number | null>(null)
+  const [composerFocus, setComposerFocus] = useState(false)
+
+  const threadRef   = useRef<HTMLDivElement>(null)
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const scopeRef    = useRef<HTMLDivElement>(null)
+
+  // Load modules + documents for the filter popover
+  useEffect(() => {
+    fetch('/api/sources')
+      .then(r => r.ok ? r.json() : null)
+      .then(d => d && setSources(d))
+      .catch(() => {})
+  }, [])
+
+  // Close scope popover on outside click
+  useEffect(() => {
+    if (!scopeOpen) return
+    const h = (e: MouseEvent) => {
+      if (scopeRef.current && !scopeRef.current.contains(e.target as Node)) {
+        setScopeOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', h)
+    return () => document.removeEventListener('mousedown', h)
+  }, [scopeOpen])
+
+  // Auto-scroll thread
+  useEffect(() => {
+    if (threadRef.current) {
+      threadRef.current.scrollTop = threadRef.current.scrollHeight
+    }
+  }, [messages])
+
+  // Auto-resize textarea
+  useEffect(() => {
+    const el = textareaRef.current
+    if (!el) return
+    el.style.height = 'auto'
+    el.style.height = Math.min(el.scrollHeight, 120) + 'px'
+  }, [chatInput])
+
+  const toggleItem = useCallback((id: string) => {
+    setSelected(prev => {
+      const next = new Set(prev)
+      next.has(id) ? next.delete(id) : next.add(id)
+      return next
+    })
+  }, [])
+
+  const scopeCount = selected.size
+  const scopeLabel = scopeCount === 0
+    ? 'All materials'
+    : `${scopeCount} source${scopeCount !== 1 ? 's' : ''} selected`
+
+  // ── Send message ────────────────────────────────────────────────
+  const send = useCallback(async () => {
+    const q = chatInput.trim()
+    if (!q || streaming) return
+
+    // Snapshot history from current messages BEFORE appending the new ones
+    const history = historyFrom(messages)
+    // Compute active lit sources from current lit state (avoids stale closure)
+    const activeLitNow = Object.entries(lit).filter(([, v]) => v).map(([k]) => k)
+
+    setChatInput('')
+    setStreaming(true)
+    setChunkCount(null)
+
+    const t    = stamp()
+    const umid = uid()  // user message id — generated outside updater (Strict Mode safe)
+    const amid = uid()  // assistant message id
+    setMessages(prev => [
+      ...prev,
+      { id: umid, role: 'user',      kind: 'user',     text: q, time: t },
+      { id: amid, role: 'assistant', kind: 'thinking', text: '', time: t },
+    ])
+
+    try {
+      const resp = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          question:   q,
+          selected:   [...selected],
+          literature: activeLitNow,
+          history,
+        }),
+      })
+
+      if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`)
+
+      const reader  = resp.body.getReader()
+      const decoder = new TextDecoder()
+      let buf       = ''
+      let text      = ''
+      let transitioned = false
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buf += decoder.decode(value, { stream: true })
+        const lines = buf.split('\n')
+        buf = lines.pop() ?? ''
+
+        for (const raw of lines) {
+          const line = raw.trim()
+          if (!line) continue
+          let parsed: Record<string, unknown>
+          try { parsed = JSON.parse(line) } catch { continue }
+
+          if (parsed.type === 'token') {
+            const tok = (parsed.text as string) ?? ''
+            if (!tok) continue
+            text += tok
+            if (!transitioned) {
+              transitioned = true
+              setMessages(prev => prev.map(m =>
+                m.id === amid ? { ...m, kind: 'streaming', text: tok } : m
+              ))
+            } else {
+              setMessages(prev => prev.map(m =>
+                m.id === amid ? { ...m, text: m.text + tok } : m
+              ))
+            }
+          } else if (parsed.type === 'done') {
+            const details   = (parsed.source_details as SourceDetail[]) ?? []
+            const lit_items = (parsed.literature     as LitItem[])      ?? []
+            const chips = buildChips(details, lit_items)
+            setChunkCount(details.length)
+            setMessages(prev => prev.map(m =>
+              m.id === amid ? { ...m, kind: 'answer', text, chips } : m
+            ))
+          } else if (parsed.type === 'error') {
+            setMessages(prev => prev.map(m =>
+              m.id === amid
+                ? { ...m, kind: 'error', text: (parsed.message as string) ?? 'Unknown error' }
+                : m
+            ))
+          }
+        }
+      }
+    } catch (err) {
+      setMessages(prev => prev.map(m =>
+        m.id === amid
+          ? { ...m, kind: 'error', text: `Request failed: ${err instanceof Error ? err.message : String(err)}` }
+          : m
+      ))
+    } finally {
+      setStreaming(false)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chatInput, streaming, selected, lit, messages])
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() }
+  }
+
+  // ── Render ──────────────────────────────────────────────────────
+  return (
+    <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+
+      {/* ── Source filter bar ── */}
+      <div style={{
+        flexShrink: 0,
+        borderBottom: '1px solid var(--line)',
+        padding: '11px 0',
+        background: 'var(--bg-sidebar)',
+        position: 'relative',
+        zIndex: 4,
+      }}>
+        <div style={{
+          maxWidth: 840, margin: '0 auto', width: '100%',
+          padding: '0 24px',
+          display: 'flex', alignItems: 'center', gap: 9, flexWrap: 'wrap',
+        }}>
+
+          {/* Scope dropdown */}
+          <div ref={scopeRef} style={{ position: 'relative' }}>
+            <ScopeTrigger
+              label={scopeLabel}
+              open={scopeOpen}
+              onClick={() => setScopeOpen(o => !o)}
+            />
+            {scopeOpen && (
+              <div
+                className="animate-fade-up"
+                style={{
+                  position: 'absolute', top: 36, left: 0, width: 320,
+                  border: '1px solid rgba(255,255,255,0.10)',
+                  borderRadius: 10,
+                  background: 'var(--surface-pop)',
+                  boxShadow: '0 12px 40px rgba(0,0,0,0.5)',
+                  padding: 7,
+                  zIndex: 20,
+                }}
+              >
+                {/* Modules group */}
+                <GroupLabel>MODULES</GroupLabel>
+                {sources.modules.length === 0 && (
+                  <div style={{ padding: '6px 8px', fontSize: 12, color: 'var(--text-faint)' }}>
+                    No modules yet
+                  </div>
+                )}
+                {sources.modules.map(m => (
+                  <CheckRow
+                    key={m.id}
+                    checked={selected.has(m.id)}
+                    label={m.name}
+                    onClick={() => toggleItem(m.id)}
+                  />
+                ))}
+
+                {/* Documents group */}
+                <div style={{
+                  borderTop: '1px solid rgba(255,255,255,0.06)',
+                  marginTop: 4, paddingTop: 4,
+                }}>
+                  <GroupLabel>DOCUMENTS</GroupLabel>
+                  {sources.documents.length === 0 && (
+                    <div style={{ padding: '6px 8px', fontSize: 12, color: 'var(--text-faint)' }}>
+                      No ingested documents
+                    </div>
+                  )}
+                  {sources.documents.map(fn => (
+                    <CheckRow
+                      key={fn}
+                      checked={selected.has(fn)}
+                      label={fn}
+                      mono
+                      onClick={() => toggleItem(fn)}
+                    />
+                  ))}
+                </div>
+
+                <div style={{
+                  fontSize: 10.5, color: 'var(--text-faint)',
+                  padding: '8px 8px 4px',
+                  borderTop: '1px solid rgba(255,255,255,0.06)',
+                  marginTop: 4,
+                }}>
+                  Empty selection searches everything.
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Divider */}
+          <div style={{ width: 1, height: 18, background: 'rgba(255,255,255,0.08)', flexShrink: 0 }} />
+
+          {/* Literature label + toggles */}
+          <span style={{
+            fontFamily: '"JetBrains Mono",monospace',
+            fontSize: 10.5, color: 'var(--text-faint)',
+          }}>literature</span>
+          <LitToggle label="PubMed"           active={lit.pubmed}           onClick={() => setLit(l => ({ ...l, pubmed: !l.pubmed }))} />
+          <LitToggle label="Semantic Scholar"  active={lit.semantic_scholar} onClick={() => setLit(l => ({ ...l, semantic_scholar: !l.semantic_scholar }))} />
+          <LitToggle label="OpenAlex"          active={lit.openalex}         onClick={() => setLit(l => ({ ...l, openalex: !l.openalex }))} />
+        </div>
+      </div>
+
+      {/* ── Message thread ── */}
+      <div ref={threadRef} style={{ flex: 1, overflowY: 'auto' }}>
+        {messages.length === 0
+          ? <EmptyState />
+          : (
+            <div style={{
+              maxWidth: 840, margin: '0 auto', width: '100%',
+              padding: '26px 24px 8px',
+              display: 'flex', flexDirection: 'column', gap: 26,
+            }}>
+              {messages.map(m => <MsgRow key={m.id} msg={m} />)}
+            </div>
+          )
+        }
+      </div>
+
+      {/* ── Composer ── */}
+      <div style={{ flexShrink: 0, padding: '0 24px 20px' }}>
+        <div style={{ maxWidth: 840, margin: '0 auto', width: '100%' }}>
+          <div
+            onFocus={() => setComposerFocus(true)}
+            onBlur={() => setComposerFocus(false)}
+            style={{
+              display: 'flex', alignItems: 'flex-end', gap: 9,
+              border: `1px solid ${composerFocus ? 'rgba(94,106,210,0.5)' : 'rgba(255,255,255,0.12)'}`,
+              borderRadius: 12,
+              background: '#101114',
+              padding: '9px 9px 9px 14px',
+              transition: 'border-color 140ms ease',
+            }}
+          >
+            <textarea
+              ref={textareaRef}
+              value={chatInput}
+              onChange={e => setChatInput(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder="Ask about the course materials or literature…"
+              rows={1}
+              style={{
+                flex: 1, background: 'transparent', border: 'none',
+                outline: 'none', resize: 'none',
+                color: 'var(--text)',
+                fontFamily: 'inherit', fontSize: 14, lineHeight: 1.5,
+                padding: '5px 0', maxHeight: 120,
+                overflow: chatInput.split('\n').length > 3 ? 'auto' : 'hidden',
+              }}
+            />
+            <SendButton onClick={send} disabled={!chatInput.trim() || streaming} />
+          </div>
+
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 7,
+            marginTop: 8, padding: '0 2px',
+            fontFamily: '"JetBrains Mono",monospace',
+            fontSize: 10.5, color: 'var(--text-faint)',
+          }}>
+            <KbdChip>⏎</KbdChip> send
+            <KbdChip style={{ marginLeft: 4 }}>⇧⏎</KbdChip> newline
+            <span style={{ marginLeft: 'auto' }}>
+              {chunkCount !== null
+                ? `RAG · qwen3 · ${chunkCount} chunk${chunkCount !== 1 ? 's' : ''} retrieved`
+                : 'RAG · qwen3'
+              }
+            </span>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  )
+}
+
+// ── Small sub-components ──────────────────────────────────────────
+
+function GroupLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <div style={{
+      fontFamily: '"JetBrains Mono",monospace',
+      fontSize: 10, color: 'var(--text-faint)',
+      letterSpacing: '0.04em',
+      padding: '6px 8px 4px',
+    }}>{children}</div>
+  )
+}
+
+function ScopeTrigger({ label, open, onClick }: { label: string; open: boolean; onClick: () => void }) {
+  const [hov, setHov] = useState(false)
+  return (
+    <div
+      onClick={onClick}
+      onMouseEnter={() => setHov(true)}
+      onMouseLeave={() => setHov(false)}
+      style={{
+        display: 'flex', alignItems: 'center', gap: 8,
+        height: 30, padding: '0 11px', borderRadius: 8,
+        border: `1px solid ${open || hov ? 'rgba(255,255,255,0.18)' : 'rgba(255,255,255,0.10)'}`,
+        cursor: 'pointer', fontSize: 12.5, color: '#c4c8cf',
+        transition: 'border-color 140ms ease',
+        userSelect: 'none',
+      }}
+    >
+      <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4">
+        <path d="M2 4h12M4 8h8M6 12h4" />
+      </svg>
+      <span>{label}</span>
+      <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="#6b7079" strokeWidth="1.5" strokeLinecap="round">
+        <path d="M4 6l4 4 4-4" />
+      </svg>
+    </div>
+  )
+}
+
+function SendButton({ onClick, disabled }: { onClick: () => void; disabled: boolean }) {
+  const [hov, setHov] = useState(false)
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      onMouseEnter={() => setHov(true)}
+      onMouseLeave={() => setHov(false)}
+      style={{
+        width: 34, height: 34, flexShrink: 0,
+        borderRadius: 8, border: 'none',
+        cursor: disabled ? 'not-allowed' : 'pointer',
+        background: disabled ? 'rgba(94,106,210,0.35)' : hov ? 'var(--accent-hover)' : 'var(--accent)',
+        color: '#fff',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        transition: 'background 140ms ease',
+      }}
+    >
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+        strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M2.5 8h10M8 3.5L12.5 8 8 12.5" />
+      </svg>
+    </button>
+  )
+}
+
+function KbdChip({ children, style }: { children: React.ReactNode; style?: React.CSSProperties }) {
+  return (
+    <span style={{
+      border: '1px solid rgba(255,255,255,0.09)',
+      borderRadius: 4, padding: '0px 5px',
+      ...style,
+    }}>{children}</span>
+  )
+}
+
+function EmptyState() {
+  return (
+    <div style={{
+      height: '100%', display: 'flex',
+      alignItems: 'center', justifyContent: 'center',
+      padding: 32,
+    }}>
+      <div style={{ textAlign: 'center' }}>
+        <div style={{
+          width: 40, height: 40, borderRadius: 10,
+          background: 'var(--accent-08)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          margin: '0 auto 14px',
+        }}>
+          <svg width="20" height="20" viewBox="0 0 16 16" fill="none" stroke="var(--accent-light)"
+            strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+            <rect x="2" y="2.5" width="12" height="9" rx="2.2" />
+            <path d="M5 11.5v2l2.4-2" />
+          </svg>
+        </div>
+        <div style={{ fontSize: 14, fontWeight: 500, color: 'var(--text-soft)', marginBottom: 6 }}>
+          Ask a question
+        </div>
+        <div style={{ fontSize: 12.5, color: 'var(--text-muted)', lineHeight: 1.6, maxWidth: 300 }}>
+          Search course materials and recent literature. Select sources above to scope retrieval.
+        </div>
+      </div>
+    </div>
+  )
+}

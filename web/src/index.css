@@ -1,0 +1,164 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Design tokens (§1.1) ── */
+:root {
+  /* Surfaces */
+  --bg-base:        #08090a;
+  --bg-sidebar:     #0a0b0d;
+  --surface:        #0c0d10;
+  --surface-2:      #0e0f12;
+  --surface-pop:    #141517;
+  --surface-toast:  #16171a;
+
+  /* Hairline borders */
+  --line:           rgba(255,255,255,0.07);
+  --line-strong:    rgba(255,255,255,0.10);
+  --line-input:     rgba(255,255,255,0.12);
+
+  /* Text */
+  --text:           #ededed;
+  --text-body:      #dfe1e6;
+  --text-soft:      #c4c8cf;
+  --text-muted:     #8a8f98;
+  --text-faint:     #5a5e66;
+  --text-ghost:     #3a3d44;
+
+  /* Accent */
+  --accent:         #5e6ad2;
+  --accent-hover:   #6e79e0;
+  --accent-deep:    #5059bd;
+  --accent-light:   #8b95ea;
+  --accent-text:    #c5cbff;
+  --accent-08:      rgba(94,106,210,0.08);
+  --accent-10:      rgba(94,106,210,0.10);
+  --accent-12:      rgba(94,106,210,0.12);
+  --accent-14:      rgba(94,106,210,0.14);
+  --accent-line:    rgba(94,106,210,0.28);
+  --accent-ring:    rgba(94,106,210,0.50);
+
+  /* Status */
+  --rec:            #ef4d56;
+  --rec-text:       #f08a8e;
+  --rec-08:         rgba(239,77,86,0.08);
+  --rec-line:       rgba(239,77,86,0.30);
+  --await:          #e9a23b;
+  --await-08:       rgba(233,162,59,0.08);
+  --await-line:     rgba(233,162,59,0.26);
+  --ok:             #3fb950;
+}
+
+/* ── Base ── */
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg-base);
+  color: var(--text);
+  font-family: 'Inter', system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  letter-spacing: -0.006em;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow: hidden;
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.10);
+  border-radius: 7px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255,255,255,0.18);
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-track { background: transparent; }
+
+/* ── Selection ── */
+::selection { background: rgba(94,106,210,0.40); color: #fff; }
+
+/* ── Placeholder ── */
+input::placeholder,
+textarea::placeholder { color: var(--text-faint); }
+
+/* ── Animations (§1.4) ── */
+@keyframes blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+
+@keyframes pulseRec {
+  0%   { box-shadow: 0 0 0 0 rgba(239,77,86,0.50); }
+  70%  { box-shadow: 0 0 0 5px rgba(239,77,86,0); }
+  100% { box-shadow: 0 0 0 0 rgba(239,77,86,0); }
+}
+
+@keyframes pulseAccent {
+  0%   { box-shadow: 0 0 0 0 rgba(94,106,210,0.50); }
+  70%  { box-shadow: 0 0 0 5px rgba(94,106,210,0); }
+  100% { box-shadow: 0 0 0 0 rgba(94,106,210,0); }
+}
+
+@keyframes wave {
+  0%, 100% { transform: scaleY(0.22); }
+  50%       { transform: scaleY(1); }
+}
+
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(7px); }
+  to   { opacity: 1; transform: none; }
+}
+
+@keyframes toastIn {
+  from { opacity: 0; transform: translateX(10px); }
+  to   { opacity: 1; transform: none; }
+}
+
+@keyframes shimmer {
+  0%   { background-position: -300px 0; }
+  100% { background-position:  300px 0; }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes freshpulse {
+  0%   { background: rgba(94,106,210,0.16); }
+  100% { background: transparent; }
+}
+
+@keyframes ingestSlide {
+  0%   { left: -35%; }
+  100% { left: 115%; }
+}
+
+/* ── Utility classes ── */
+.animate-blink      { animation: blink 1s step-end infinite; }
+.animate-pulse-rec  { animation: pulseRec 1.6s infinite; }
+.animate-pulse-proc { animation: pulseRec 1.2s infinite; }
+.animate-fade-up    { animation: fadeUp 0.14s ease; }
+.animate-toast-in   { animation: toastIn 0.18s ease; }
+.animate-spin-slow  { animation: spin 0.7s linear infinite; }
+.animate-shimmer {
+  background: linear-gradient(90deg, #16171a, #1f2024, #16171a);
+  background-size: 300px 100%;
+  animation: shimmer 1.3s linear infinite;
+}
+.animate-ingest-bar {
+  position: absolute;
+  width: 35%;
+  height: 100%;
+  border-radius: 3px;
+  animation: ingestSlide 1.4s ease-in-out infinite;
+}
