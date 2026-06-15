@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Audio Spike · Prof AI</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px;
+    font-family: 'JetBrains Mono', 'Courier New', monospace;
+    font-size: 13px;
+    background: #08090a; color: #d0d3d8;
+    line-height: 1.5;
+  }
+  h2 { margin: 0 0 18px; color: #8b95ea; font-size: 13.5px; font-weight: 600; letter-spacing: -0.01em; }
+  button {
+    font-family: inherit; font-size: 12px;
+    padding: 6px 14px; border-radius: 6px;
+    border: 1px solid rgba(255,255,255,0.14);
+    background: #14151a; color: #c4c8cf;
+    cursor: pointer; transition: background 120ms;
+  }
+  button:hover:not(:disabled) { background: #1e1f26; }
+  button:disabled { opacity: 0.32; cursor: default; }
+  #btn-start { background: #5e6ad2; border-color: transparent; color: #fff; }
+  #btn-start:hover:not(:disabled) { background: #6e79e0; }
+
+  .controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 14px; }
+  .level-wrap { display: flex; align-items: center; gap: 7px; }
+  .level-track { width: 160px; height: 8px; background: #1a1b22; border: 1px solid rgba(255,255,255,0.09); border-radius: 3px; overflow: hidden; }
+  #level-bar { width: 0%; height: 100%; background: #5e6ad2; transition: width 80ms linear; }
+  #status { font-size: 10.5px; color: #5a5e66; }
+
+  #log {
+    border: 1px solid rgba(255,255,255,0.07);
+    background: #0c0d10;
+    border-radius: 8px;
+    padding: 12px 14px;
+    height: 420px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .log-transcript { color: #ededed; font-size: 13px; margin-top: 6px; }
+  .log-latency    { color: #5a5e66; font-size: 10.5px; padding-left: 14px; }
+  .log-info       { color: #5a5e66; font-size: 11px; }
+  .log-error      { color: #ef4d56; font-size: 11px; }
+
+  .threshold-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; font-size: 11px; color: #5a5e66; }
+  input[type=range] { accent-color: #5e6ad2; }
+</style>
+</head>
+<body>
+<h2>Audio Spike — mic → WebSocket → Whisper → TTS → browser</h2>
+
+<div class="controls">
+  <button id="btn-start" onclick="startMic()">▶ Start</button>
+  <button id="btn-stop"  onclick="stopMic()"   disabled>■ Stop</button>
+  <button id="btn-speak" onclick="speakLast()" disabled>⊳ Speak last</button>
+  <div class="level-wrap">
+    <span style="font-size:10.5px;color:#5a5e66;">Level</span>
+    <div class="level-track"><div id="level-bar"></div></div>
+  </div>
+  <span id="status">idle</span>
+</div>
+
+<div class="threshold-row">
+  RMS threshold:
+  <input type="range" id="thr-slider" min="2" max="60" value="12" oninput="updateThreshold(this.value)">
+  <span id="thr-val">0.012</span>
+  <span style="color:#3a3d44;">(lower = more sensitive · raise if transcribing background noise)</span>
+</div>
+
+<div id="log"></div>
+
+<script>
+// ── AudioWorklet source (inlined as blob URL) ─────────────────────
+// Runs in the audio rendering thread. Decimates 48kHz → 16kHz,
+// applies an RMS gate, and posts Int16 frames + flush events to main.
+const WORKLET_SRC = `
+class AudioProc extends AudioWorkletProcessor {
+  constructor(options) {
+    super(options);
+    this._buf        = [];
+    this._silCount   = 0;
+    this._hasSpeech  = false;
+    this._threshold  = 0.012;  // overridden via port message
+    this._SIL_FRAMES = 35;     // 35 × 20 ms = 700 ms silence → flush
+
+    this.port.onmessage = (ev) => {
+      if (ev.data.type === 'set_threshold')
+        this._threshold = ev.data.value;
+    };
+  }
+
+  process(inputs) {
+    const ch = inputs[0]?.[0];
+    if (!ch) return true;
+
+    // Integer decimation: 48 kHz → 16 kHz = factor 3.
+    // sampleRate is a global in AudioWorkletGlobalScope.
+    const dec = Math.round(sampleRate / 16000);
+
+    for (let i = 0; i < ch.length; i += dec) {
+      this._buf.push(ch[i]);
+
+      if (this._buf.length >= 320) {       // 20 ms at 16 kHz
+        const chunk = this._buf.splice(0, 320);
+
+        // RMS energy
+        let sum = 0;
+        for (const s of chunk) sum += s * s;
+        const rms = Math.sqrt(sum / chunk.length);
+
+        this.port.postMessage({ type: 'rms', rms });
+
+        if (rms > this._threshold) {
+          this._hasSpeech = true;
+          this._silCount  = 0;
+          // Convert float32 → Int16
+          const i16 = new Int16Array(chunk.length);
+          for (let j = 0; j < chunk.length; j++)
+            i16[j] = Math.max(-32768, Math.min(32767, (chunk[j] * 32767) | 0));
+          this.port.postMessage({ type: 'audio', buf: i16.buffer }, [i16.buffer]);
+        } else if (this._hasSpeech) {
+          this._silCount++;
+          if (this._silCount >= this._SIL_FRAMES) {
+            this._hasSpeech = false;
+            this._silCount  = 0;
+            this.port.postMessage({ type: 'flush' });
+          }
+        }
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('audio-proc', AudioProc);
+`;
+
+// ── State ─────────────────────────────────────────────────────────
+
+let ws          = null;
+let audioCtx    = null;
+let workletNode = null;
+let micStream   = null;
+let sourceNode  = null;
+let playTime    = 0;       // next available time slot in the shared AudioContext
+let lastText    = '';
+
+const $log      = document.getElementById('log');
+const $status   = document.getElementById('status');
+const $levelBar = document.getElementById('level-bar');
+
+// ── Logging ───────────────────────────────────────────────────────
+
+function addLog(text, cls = 'log-info') {
+  const d   = document.createElement('div');
+  d.className = cls;
+  d.textContent = text;
+  $log.appendChild(d);
+  $log.scrollTop = $log.scrollHeight;
+}
+
+function setStatus(s) { $status.textContent = s; }
+
+// ── Threshold slider ──────────────────────────────────────────────
+
+function updateThreshold(v) {
+  const val = v / 1000;
+  document.getElementById('thr-val').textContent = val.toFixed(3);
+  if (workletNode)
+    workletNode.port.postMessage({ type: 'set_threshold', value: val });
+}
+
+// ── TTS playback (queued, never overlapping) ──────────────────────
+
+async function handleTtsAudio(arrayBuffer) {
+  if (!audioCtx) return;
+  const ctx = audioCtx;   // capture before any awaits
+  try {
+    const decoded  = await ctx.decodeAudioData(arrayBuffer);
+    const src      = ctx.createBufferSource();
+    src.buffer     = decoded;
+    src.connect(ctx.destination);
+    const now      = ctx.currentTime;
+    const startAt  = Math.max(now, playTime);
+    src.start(startAt);
+    playTime = startAt + decoded.duration;
+  } catch (e) {
+    addLog('TTS decode error: ' + e.message, 'log-error');
+  }
+}
+
+// ── WebSocket message handler ─────────────────────────────────────
+
+function handleJsonMsg(msg) {
+  if (msg.type === 'transcript') {
+    if (msg.text) {
+      lastText = msg.text;
+      addLog(msg.text, 'log-transcript');
+      addLog(`  ↳ whisper ${msg.ms} ms  conf ${msg.confidence}`, 'log-latency');
+      document.getElementById('btn-speak').disabled = false;
+    } else {
+      addLog('  (empty — silence or below threshold)', 'log-info');
+    }
+    if (status.textContent !== 'stopped') setStatus('listening…');
+  } else if (msg.type === 'tts_start') {
+    addLog(`  ↳ TTS synthesized in ${msg.ms} ms — queuing playback`, 'log-latency');
+  } else if (msg.type === 'tts_end') {
+    // playback is already queued; nothing to do here
+  }
+}
+
+// ── Mic setup ─────────────────────────────────────────────────────
+
+async function setupMic() {
+  micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+  audioCtx  = new AudioContext();
+  playTime  = 0;
+
+  // Load worklet from blob URL (allows inlining the source)
+  const blob    = new Blob([WORKLET_SRC], { type: 'application/javascript' });
+  const blobUrl = URL.createObjectURL(blob);
+  await audioCtx.audioWorklet.addModule(blobUrl);
+  URL.revokeObjectURL(blobUrl);
+
+  workletNode = new AudioWorkletNode(audioCtx, 'audio-proc');
+
+  workletNode.port.onmessage = (ev) => {
+    const msg = ev.data;
+
+    if (msg.type === 'audio') {
+      // Binary PCM frame → send over WS
+      if (ws && ws.readyState === WebSocket.OPEN)
+        ws.send(msg.buf);   // ArrayBuffer transferred from worklet
+
+    } else if (msg.type === 'flush') {
+      // End of utterance — ask server to transcribe
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'flush' }));
+        setStatus('transcribing…');
+      }
+
+    } else if (msg.type === 'rms') {
+      // Drive the level meter (scale: 0.012 threshold ≈ ~24% width)
+      const pct = Math.min(100, msg.rms * 3500);
+      $levelBar.style.width = pct + '%';
+      if (msg.rms > parseFloat(document.getElementById('thr-val').textContent)) {
+        if ($status.textContent !== 'transcribing…') setStatus('speaking…');
+      } else {
+        if ($status.textContent === 'speaking…') setStatus('listening…');
+      }
+    }
+  };
+
+  // source → worklet (NOT connected to destination — we don't want sidetone)
+  sourceNode = audioCtx.createMediaStreamSource(micStream);
+  sourceNode.connect(workletNode);
+
+  const dec = Math.round(audioCtx.sampleRate / 16000);
+  addLog(`mic active  sample_rate=${audioCtx.sampleRate} Hz  decimation=${dec}×  → 16 kHz`, 'log-info');
+  setStatus('listening…');
+}
+
+// ── Public controls ───────────────────────────────────────────────
+
+async function startMic() {
+  document.getElementById('btn-start').disabled = true;
+  document.getElementById('btn-stop').disabled  = false;
+  setStatus('connecting…');
+  addLog('─── session start ───', 'log-info');
+
+  const wsUrl = location.origin.replace(/^http/, 'ws') + '/ws/audio';
+  ws = new WebSocket(wsUrl);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = async () => {
+    addLog('WebSocket open', 'log-info');
+    setStatus('mic starting…');
+    try {
+      await setupMic();
+    } catch (e) {
+      addLog('Mic error: ' + e.message, 'log-error');
+      setStatus('mic error');
+    }
+  };
+
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === 'string') {
+      try { handleJsonMsg(JSON.parse(ev.data)); }
+      catch (e) { addLog('JSON parse error: ' + e, 'log-error'); }
+    } else {
+      // ArrayBuffer = WAV bytes from TTS
+      handleTtsAudio(ev.data);
+    }
+  };
+
+  ws.onerror = () => {
+    addLog('WebSocket error', 'log-error');
+    setStatus('ws error');
+  };
+
+  ws.onclose = () => {
+    addLog('WebSocket closed', 'log-info');
+    if ($status.textContent !== 'stopped') setStatus('disconnected');
+  };
+}
+
+function stopMic() {
+  if (workletNode) { workletNode.disconnect(); workletNode = null; }
+  if (sourceNode)  { sourceNode.disconnect();  sourceNode  = null; }
+  if (micStream)   { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  if (audioCtx)    { audioCtx.close();  audioCtx  = null; }
+  if (ws)          { ws.close();         ws         = null; }
+  playTime = 0;
+  $levelBar.style.width = '0%';
+  document.getElementById('btn-start').disabled = false;
+  document.getElementById('btn-stop').disabled  = true;
+  addLog('─── session end ───', 'log-info');
+  setStatus('stopped');
+}
+
+function speakLast() {
+  if (!ws || ws.readyState !== WebSocket.OPEN || !lastText) return;
+  ws.send(JSON.stringify({ type: 'speak', text: lastText }));
+  addLog('↑ re-speak: "' + lastText + '"', 'log-info');
+}
+</script>
+</body>
+</html>
