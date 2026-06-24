@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import type { HealthData } from '../types'
 
-const POLL_INTERVAL = 5000
+const POLL_INTERVAL = 30_000
 
 const LOADING: HealthData = {
   backend: { status: 'degraded', info: 'connecting…' },

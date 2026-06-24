@@ -7,6 +7,7 @@ the x-api-key header automatically.
 
 import json
 import logging
+import os
 import time
 import urllib.error
 import urllib.parse
@@ -17,15 +18,19 @@ API_BASE = "https://api.semanticscholar.org/graph/v1"
 RESULTS_LIMIT = 20
 RECENCY_YEARS = 2
 
-# Optional: set to your API key string for higher rate limits. Empty = unauthenticated.
-SEMANTIC_SCHOLAR_API_KEY = ""
+# Optional: set SEMANTIC_SCHOLAR_API_KEY env var to your key from
+# https://www.semanticscholar.org/product/api for higher rate limits.
+# Sent as the x-api-key header. Empty string = unauthenticated (public tier).
+SEMANTIC_SCHOLAR_API_KEY = os.environ.get("SEMANTIC_SCHOLAR_API_KEY", "")
 
 _FIELDS = "title,abstract,authors,year,venue,externalIds,citationCount"
 _cache: dict[str, list[dict]] = {}
 logger = logging.getLogger(__name__)
 
-# Exponential backoff delays (seconds) for 429 responses. 4 retries = 5 total attempts.
-_RETRY_DELAYS = (2, 4, 8, 16)
+# Exponential backoff delays (seconds) for 429 responses. 2 retries = 3 total attempts,
+# ≤6 s total wait. Keeping this short so a throttled SS doesn't stall the whole query —
+# the per-source timeout in query.py is the outer safety net.
+_RETRY_DELAYS = (2, 4)
 # Minimum gap between consecutive outbound requests to avoid self-bursting.
 _INTER_REQUEST_DELAY = 1.0
 _last_request_time: float = 0.0
@@ -105,8 +110,8 @@ def search_semantic_scholar(
 ) -> list[dict]:
     """Search Semantic Scholar and return a list of paper dicts.
 
-    Returns [] on error (logged). On 429, retries up to 4 times with exponential
-    backoff (2s, 4s, 8s, 16s), honoring Retry-After if the server sends one.
+    Returns [] on error (logged). On 429, retries up to 2 times with exponential
+    backoff (2s, 4s), honoring Retry-After if the server sends one.
     """
     today = date.today()
     start_year = today.year - recency_years

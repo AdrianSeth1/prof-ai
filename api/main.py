@@ -7,9 +7,11 @@ Phase 2: /api/ingest (streaming NDJSON) and /api/materials.
 import asyncio
 import concurrent.futures
 import json
+import logging
 import re
 import subprocess
 import sys
+import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -17,6 +19,7 @@ from pathlib import Path
 
 import httpx
 import numpy as np
+import ollama
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -63,6 +66,13 @@ _whisper = None
 _tts: PiperTTS | None = None
 
 
+class _NoHealthFilter(logging.Filter):
+    """Drop uvicorn access log lines for successful GET /api/health polls."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not ("GET /api/health" in msg and " 200 " in msg)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _whisper, _tts
@@ -73,6 +83,30 @@ async def lifespan(app: FastAPI):
     print("[STARTUP] pre-warming Piper TTS…", flush=True)
     _tts = await loop.run_in_executor(_THREAD_POOL, PiperTTS)
     print(f"[STARTUP] TTS ready — sample_rate={_tts.sample_rate} Hz", flush=True)
+    print("[STARTUP] pre-warming answer LLM (qwen3:30b-a3b)…", flush=True)
+
+    def _prewarm_llm() -> float:
+        t0 = time.time()
+        ollama.chat(
+            model="qwen3:30b-a3b",
+            messages=[{"role": "user", "content": "hi"}],
+            think=False,
+            keep_alive="30m",
+            options={"num_predict": 1},
+        )
+        return time.time() - t0
+
+    try:
+        elapsed = await loop.run_in_executor(_THREAD_POOL, _prewarm_llm)
+        print(f"[STARTUP] LLM ready ({elapsed:.1f}s)", flush=True)
+    except Exception as exc:
+        print(f"[STARTUP] LLM pre-warm failed (non-fatal): {exc}", flush=True)
+
+    # Suppress noisy GET /api/health 200 lines from uvicorn's access log.
+    # Installed here so it takes effect whether the app is started via
+    # `python -m api.main` or the uvicorn CLI.
+    logging.getLogger("uvicorn.access").addFilter(_NoHealthFilter())
+
     yield
 
 
@@ -149,14 +183,17 @@ def _check_gpu() -> dict:
 
 # ── Health endpoint ───────────────────────────────────────────────
 
+_last_health_status: str = ""
+
 @app.get("/api/health")
 async def health():
+    global _last_health_status
     ollama = await _check_ollama()
     gpu    = _check_gpu()
-    print(
-        f"[HEALTH] backend=up  ollama={ollama['status']}  gpu={gpu['status']}",
-        flush=True,
-    )
+    status_line = f"backend=up  ollama={ollama['status']}  gpu={gpu['status']}"
+    if status_line != _last_health_status:
+        print(f"[HEALTH] {status_line}", flush=True)
+        _last_health_status = status_line
     return JSONResponse({
         "backend": {"status": "up",   "info": "127.0.0.1:8000"},
         "ollama":  ollama,
@@ -411,6 +448,10 @@ async def ws_lecture(ws: WebSocket):
     gap_worker: LiveGapWorker | None = None
     paused = False
     ws_session_start: float = 0.0
+    # Cancel flag: set by the "cancel" message handler, cleared at the START of
+    # each qa_handler invocation. Checked at two points inside qa_handler so
+    # TTS is skipped if cancel arrived while the LLM was still computing.
+    _qa_cancel = threading.Event()
 
     def emit(obj: dict) -> None:
         loop.call_soon_threadsafe(outbound.put_nowait, obj)
@@ -435,6 +476,7 @@ async def ws_lecture(ws: WebSocket):
 
     def qa_handler(sess) -> None:
         """Runs in a bg thread after push_question_audio captures a question."""
+        _qa_cancel.clear()  # fresh start for each Q&A cycle
         question = sess.pending_question or ""
         print(f"[WS/lecture] QA: {question!r}", flush=True)
         emit({"type": "question", "text": question})
@@ -453,10 +495,24 @@ async def ws_lecture(ws: WebSocket):
                 answer, reasoning, sources = answer_question(
                     question, sess.linked_documents, sess
                 )
+
+            # Check cancel after LLM (the slow step). If cancelled while we were
+            # computing, skip the answer and TTS entirely.
+            if _qa_cancel.is_set():
+                print("[WS/lecture] QA cancelled after LLM — skipping answer+TTS", flush=True)
+                return
+
             sess.add_qa_entry(question, answer, sources=sources, reasoning=reasoning)
             emit({"type": "answer", "text": answer, "sources": sources, "reasoning": reasoning})
             emit({"type": "state", "mode": "speaking"})
             wav = tts_inst.synthesize(answer)
+
+            # Check cancel after TTS synthesis. If cancelled while synthesizing,
+            # skip sending the audio bytes (frontend already muted / stopped playback).
+            if _qa_cancel.is_set():
+                print("[WS/lecture] QA cancelled after TTS synth — skipping audio send", flush=True)
+                return
+
             emit({"type": "tts_start"})
             emit_bytes(wav)
             emit({"type": "tts_end"})
@@ -578,7 +634,11 @@ async def ws_lecture(ws: WebSocket):
                     await ws.send_text(json.dumps({"type": "state", "mode": "awaiting"}))
 
             elif kind == "cancel":
-                if session and session.current_mode() == Mode.AWAITING_QUESTION:
+                # Signal the qa_handler bg thread to skip answer+TTS if it's
+                # still running, then immediately force the session back to
+                # LECTURE so no mode gets stuck regardless of timing.
+                _qa_cancel.set()
+                if session:
                     session.set_mode(Mode.LECTURE)
                     buf.clear()
                     await ws.send_text(json.dumps({"type": "state", "mode": "lecture"}))

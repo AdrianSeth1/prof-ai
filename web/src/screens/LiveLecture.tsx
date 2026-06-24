@@ -133,6 +133,8 @@ export default function LiveLecture({ onToast }: Props) {
   const micStreamRef   = useRef<MediaStream | null>(null)
   const sourceNodeRef  = useRef<MediaStreamAudioSourceNode | null>(null)
   const playTimeRef    = useRef<number>(0)
+  const ttsSourceRef   = useRef<AudioBufferSourceNode | null>(null)  // currently-playing TTS node
+  const ttsMutedRef    = useRef<boolean>(false)                      // true after cancel, until next question
   const txEndRef       = useRef<HTMLDivElement | null>(null)
   const levelBarRef    = useRef<HTMLDivElement | null>(null)
   const curQuestionRef = useRef<string>('')
@@ -199,17 +201,33 @@ export default function LiveLecture({ onToast }: Props) {
     txEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [segments])
 
+  // ── TTS interrupt — stops any in-flight audio node immediately ──
+  const interruptTts = useCallback(() => {
+    const src = ttsSourceRef.current
+    if (src) {
+      try { src.stop() } catch { /* already stopped */ }
+      ttsSourceRef.current = null
+    }
+    playTimeRef.current = 0
+  }, [])
+
   // ── TTS playback (queued, never overlapping) ────────────────────
   const handleTtsAudio = useCallback(async (buf: ArrayBuffer) => {
     const ctx = audioCtxRef.current
     if (!ctx) return
+    // If cancelled while the LLM/TTS was computing, the backend already skipped
+    // sending bytes — but as a belt-and-braces guard, drop anything that arrives
+    // while muted.
+    if (ttsMutedRef.current) return
     try {
       const decoded = await ctx.decodeAudioData(buf)
+      if (ttsMutedRef.current) return  // re-check after await (cancel can arrive during decode)
       const src = ctx.createBufferSource()
       src.buffer = decoded
       src.connect(ctx.destination)
       const startAt = Math.max(ctx.currentTime, playTimeRef.current)
       src.start(startAt)
+      ttsSourceRef.current = src
       playTimeRef.current = startAt + decoded.duration
     } catch (e) {
       console.error('TTS decode error:', e)
@@ -246,6 +264,7 @@ export default function LiveLecture({ onToast }: Props) {
       }
 
     } else if (type === 'question') {
+      ttsMutedRef.current = false  // new Q&A cycle — allow TTS playback
       const q = (msg.text as string) || ''
       curQuestionRef.current = q
       setCurrentQuestion(q)
@@ -404,8 +423,13 @@ export default function LiveLecture({ onToast }: Props) {
   const cancelAsk = useCallback(() => {
     if (qaTimeoutRef.current) { clearTimeout(qaTimeoutRef.current); qaTimeoutRef.current = null }
     _restoreThreshold()
+    // Stop any in-flight TTS audio immediately and mute future bytes for this
+    // cycle (handles the race where TTS bytes are already in-flight when cancel
+    // is clicked). ttsMutedRef is cleared when the next 'question' message arrives.
+    ttsMutedRef.current = true
+    interruptTts()
     wsRef.current?.send(JSON.stringify({ type: 'cancel' }))
-  }, [_restoreThreshold])
+  }, [_restoreThreshold, interruptTts])
 
   const togglePause = useCallback(() => {
     wsRef.current?.send(JSON.stringify({ type: uiMode === 'paused' ? 'resume_mic' : 'pause_mic' }))
@@ -834,30 +858,31 @@ export default function LiveLecture({ onToast }: Props) {
         </button>
 
         {uiMode === 'awaiting' && (
-          <>
-            <button
-              onClick={doneSpeaking}
-              style={{
-                background: 'var(--await)', color: '#fff',
-                border: 'none', borderRadius: 6,
-                padding: '6px 14px',
-                fontSize: 12, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit',
-              }}
-            >
-              ✓ Done speaking
-            </button>
-            <button
-              onClick={cancelAsk}
-              style={{
-                background: 'rgba(239,77,86,0.10)',
-                border: '1px solid rgba(239,77,86,0.3)', borderRadius: 6,
-                padding: '6px 14px', color: 'var(--rec)',
-                fontSize: 12, cursor: 'pointer', fontFamily: 'inherit',
-              }}
-            >
-              Cancel
-            </button>
-          </>
+          <button
+            onClick={doneSpeaking}
+            style={{
+              background: 'var(--await)', color: '#fff',
+              border: 'none', borderRadius: 6,
+              padding: '6px 14px',
+              fontSize: 12, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit',
+            }}
+          >
+            ✓ Done speaking
+          </button>
+        )}
+
+        {(uiMode === 'awaiting' || uiMode === 'processing' || uiMode === 'speaking') && (
+          <button
+            onClick={cancelAsk}
+            style={{
+              background: 'rgba(239,77,86,0.10)',
+              border: '1px solid rgba(239,77,86,0.3)', borderRadius: 6,
+              padding: '6px 14px', color: 'var(--rec)',
+              fontSize: 12, cursor: 'pointer', fontFamily: 'inherit',
+            }}
+          >
+            Cancel
+          </button>
         )}
 
         <button

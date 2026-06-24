@@ -8,6 +8,9 @@ This document is written for a future AI session (Claude Code or Claude web) wit
 
 | Date | Summary |
 |---|---|
+| 2026-06-24 | Literature search rate-limiting fixes. `semantic_scholar.py`: `SEMANTIC_SCHOLAR_API_KEY` now read from `os.environ.get("SEMANTIC_SCHOLAR_API_KEY", "")` (was hardcoded `""`); `_RETRY_DELAYS` shortened to `(2, 4)` — 2 retries max, ≤6 s total wait (was `(2,4,8,16)` = 30 s). `query.py`: `_SOURCE_TIMEOUT = 8` constant added; `as_completed(futures, timeout=_SOURCE_TIMEOUT)` wraps the parallel literature fetch, catching `FuturesTimeoutError` and logging which sources were abandoned — completed sources still contribute results; `ollama.chat` in `query_stream` gains `keep_alive="30m"` so the Chat LLM stays resident between queries. |
+| 2026-06-24 | LLM pre-warm + clean TTS cancel/interrupt (React/FastAPI app). `api/main.py` lifespan: after Whisper+Piper pre-warm, fires a throwaway `ollama.chat(model="qwen3:30b-a3b", messages=[{"role":"user","content":"hi"}], think=False, keep_alive="30m", options={"num_predict":1})` in `_THREAD_POOL` to load the answer LLM into VRAM before the first real question. `_qa_cancel = threading.Event()` added inside the `ws_lecture` closure. `qa_handler`: calls `_qa_cancel.clear()` at entry; checks `_qa_cancel.is_set()` after the LLM call and after `tts.synthesize()` — if set, returns early skipping answer emit and audio bytes. `cancel` message handler: calls `_qa_cancel.set()` and forces `session.set_mode(Mode.LECTURE)` regardless of current mode (was previously guarded by `mode == AWAITING_QUESTION` only). `LiveLecture.tsx`: added `ttsSourceRef` (AudioBufferSourceNode | null) and `ttsMutedRef` (boolean) refs. New `interruptTts()` callback stops and nulls the source node, resets `playTimeRef.current=0`. `handleTtsAudio`: stores source in `ttsSourceRef`, checks `ttsMutedRef.current` before and after the async `decodeAudioData` await — drops bytes if muted. `cancelAsk`: sets `ttsMutedRef.current=true`, calls `interruptTts()`, restores gate threshold, then sends WS cancel. `question` message handler: resets `ttsMutedRef.current=false` to unmute the next Q&A cycle. Cancel button: was shown only in `uiMode==='awaiting'`, now shown for `awaiting \| processing \| speaking`; "Done speaking" button stays awaiting-only. Files touched: `api/main.py`, `web/src/screens/LiveLecture.tsx`. |
+| 2026-06-24 | Question-capture flush: Done Speaking button + adaptive silence + 20s hard cap. `app.py`: Added `ask_ai_done_btn` ("✓ Done Speaking") to the main controls row, enabled only while mode is AWAITING_QUESTION and not in conversation — polled by the existing 2s timer via new `poll_ask_ai_done_btn()`. New `ask_ai_done_fn()` force-flushes `state["qa_buffer"]` via `push_question_audio()` immediately. Replaced the old fixed 5.5s capture window with adaptive silence detection: `ambient_rms` is tracked during LECTURE mode via a slow asymmetric EMA (α=0.05, only updates when chunk_rms < ambient×3 to exclude speech); in AWAITING_QUESTION (single-turn) the silence threshold is `max(0.005, ambient_rms × 2.5)` instead of the fixed `_SPEECH_ENERGY_THRESHOLD`; `qa_silence_samples` counter flushes after 600ms of sub-threshold audio but only after ≥1.5s of buffer accumulated (`_QA_MIN_WINDOW_S`). Hard cap raised to `_QA_MAX_WINDOW_S=20.0s` (was implicit 5.5s). State dict gained two fields: `ambient_rms` (float, init 0.005) and `qa_silence_samples` (int, init 0). All state init sites updated (`start_recording`, `stop_recording_audio`, `handle_pause`, `handle_resume`, `handle_audio_chunk` null-init). `stop_recording` return and `stop_btn.click` outputs updated to include `ask_ai_done_btn`. Conversation mode (in_conversation=True AWAITING path) is unchanged — still accumulates until "Done speaking" / 60s cap. Cancel still aborts to LECTURE at any time. |
 | 2026-06-15 | Structured gap findings + question-capture robustness. `gaps.py`: added `parse_gap_findings(text) -> list[dict]|None` (exported, strips code fences, finds first JSON array). Prompt changed to request JSON array `{topic, status:"covered"|"partial"|"uncovered", note, source}`. `live_gap.py`: imports `parse_gap_findings` from gaps.py; `live_gaps_stream` prompt same JSON format; `_run_once` calls `parse_gap_findings` and delivers `list[dict]|str` to `on_result`. `api/main.py`: `on_gap` now emits `{type:"gap", findings:[...]}` or `{type:"gap", raw:"..."}`. `/api/gaps` endpoint buffers content tokens, streams think tokens, parses findings at end, emits `{type:"done", findings:[...], raw:"..."}`. `web/src/components/FindingCard.tsx`: new shared card component with green/amber/neutral status colours. `LiveLecture.tsx`: gap state changed to `gapFindings:Finding[]|null` + `gapRaw:string|null`; gap panel renders FindingCards or raw fallback text. `GapsAnalysis.tsx`: `findings` state populated from `done` message; renders FindingCard grid; raw text fallback via FindingsBlock. `LiveLecture.tsx` question-capture robustness: AudioWorklet gains `force_flush` message (drains partial buffer immediately); ambient RMS tracked via slow EMA (α=0.005); `askAI` raises gate threshold to `max(gate, ambient×1.3)` before entering AWAITING; `doneSpeaking` restores threshold + calls `force_flush`; `cancelAsk` also restores threshold; 20 s auto-flush timeout via useEffect; "Done speaking" button visible in side-panel awaiting card AND control bar. Build: 0 TypeScript errors. |
 | 2026-06-15 | Phase 5B — Live Lecture screen wired in new React/FastAPI app. `api/main.py`: added `/ws/lecture` WebSocket endpoint with full mode state machine (LECTURE/AWAITING_QUESTION/PROCESSING + speaking/paused derived at WS layer), asyncio lifespan for Whisper+TTS pre-warming, asyncio.Queue drain task to bridge bg-thread QA handler to WS, LiveGapWorker integration, `answer_question`/`answer_conversation_turn` dispatch on `session.in_conversation`, TTS WAV sent as binary WS frames. `web/src/screens/LiveLecture.tsx`: full screen replacing placeholder — pre-start panel (name, doc picker), AudioWorklet blob URL capture (48kHz→16kHz, RMS gate, 700ms flush), state bar (5 visual states, color-coded), transcript pane (JetBrains Mono 13.5px), answer card with citation chips, live gaps panel, Q&A history, control bar with Ask AI/Pause/Cancel/Conv mode/gate slider. `web/src/App.tsx`: passes `onToast` to `<LiveLecture />`. `npm run build` clean — 0 TypeScript errors. Gradio `app.py` unchanged. |
 | 2026-06-12 | Whisper fixes after first SPEC 2 field test. (1) `temperature=0.0` caused an un-escapable repetition loop ("university university ..." for a full segment) because temperature retries are also Whisper's escape hatch for repetition. Changed to `temperature=[0.0, 0.2, 0.4]` in live_transcribe.py and batch_transcribe.py — keeps loop escape, still avoids the high-temperature fabrication zone. (2) Vocab term filtering in `build_whisper_prompt()`: drops terms under 3 chars, bare numbers/dates, and duplicates before classification, because the 14b extractor shredded a doc title into junk tokens ("September", "30", "2014") that polluted the initial prompt. |
@@ -73,6 +76,10 @@ Prof's browser mic
                   → speech: append to state["buffer"], reset state["silence_samples"] = 0
               chunk_rms <  _SPEECH_ENERGY_THRESHOLD (0.02)
                   → noise/silence: discard chunk, state["silence_samples"] += len(chunk)
+          ambient noise tracking (passive, used by Q&A path only):
+              if chunk_rms < state["ambient_rms"] × 3.0:
+                  ambient = (1 - 0.05) × ambient + 0.05 × chunk_rms  (clamped 0.001–0.1)
+              speech chunks do not raise the ambient estimate
           flush condition:
               silence_samples * 1000 / 16000 >= _VAD_SILENCE_MS (600ms) AND len(buffer) > 0
               OR len(buffer) / 16000 >= _MAX_BUFFER_S (15.0s)
@@ -83,16 +90,33 @@ Prof's browser mic
                     → filter: MIN_WORDS=2, MIN_AVG_LOGPROB=-1.0
                     → session.append_segment() → transcript file + ChromaDB
 
-      mode == AWAITING_QUESTION:
-          all audio accumulated in state["qa_buffer"] (no noise gate in Q&A path)
-          when len(qa_buf) / 16000 >= QA_BUFFER_SECONDS + QA_TAIL_SECONDS (5.5s):
-              push_question_audio(qa_buf) in live_transcribe.py
+      mode == AWAITING_QUESTION (single-turn Ask AI, not in_conversation):
+          all audio accumulated in state["qa_buffer"]
+          adaptive silence threshold = max(0.005, state["ambient_rms"] × 2.5)
+              (ambient_rms was calibrated during LECTURE; 2.5× lifts threshold
+               above room noise but below speech — so end-of-question silence
+               registers even in noisy rooms)
+          state["qa_silence_samples"] increments when chunk_rms < adaptive_thresh,
+              resets to 0 on speech
+          flush conditions (whichever fires first):
+              A. buf_s >= _QA_MAX_WINDOW_S (20.0s) — hard cap, always fires
+              B. buf_s >= _QA_MIN_WINDOW_S (1.5s) AND qa_silence_ms >= 600ms
+                    — adaptive silence detected after minimum window
+          "✓ Done Speaking" button (ask_ai_done_btn) — also calls push_question_audio
+              directly; primary reliable path, independent of silence detection
+          on any flush → push_question_audio(qa_buf) in live_transcribe.py
               → transcribe_audio()
               → validity check: MIN_WORDS, MIN_AVG_LOGPROB
                   fail → session.set_mode(LECTURE)
                   pass → session.pending_question = text
                        → session.set_mode(PROCESSING)
                        → fire _qa_handler thread in app.py
+
+      mode == AWAITING_QUESTION (conversation mode, in_conversation=True):
+          all audio accumulated in state["qa_buffer"] — no silence detection
+          "Done speaking" button (done_btn, in Conversation accordion) is
+              the primary flush path
+          safety cap: buf_s >= _CONV_MAX_TURN_S (60.0s) → auto-flush
 
       mode == PROCESSING:
           discard all audio while _qa_handler runs
@@ -120,8 +144,8 @@ Upload (PDF/DOCX/PPTX/TXT) via Add Materials tab
 session.linked_documents (list of filenames chosen by prof in UI)
   → for each doc: ChromaDB.get(where=source_file + content_type=source_document)
   → take first 2 chunks per doc, concatenate, cap at 4000 chars
-  → qwen3:14b with "/no_think" in prompt text (soft switch — UNVERIFIED reliability,
-    think= API param not set, may still think on some Ollama versions)
+  → qwen3:14b with think=False (API param, set since 2026-06-12; prior `/no_think`
+    prefix was removed)
   → returns comma-separated raw vocabulary
   → classify terms:
       multi-word AND starts-capital → proper noun ("David A. Kolb")
@@ -229,9 +253,24 @@ All values verified against the actual code.
 
 | Constant | Value | Role |
 |---|---|---|
-| `_SPEECH_ENERGY_THRESHOLD` | `0.02` | RMS gate: chunks below this are noise and discarded. Raise if background noise bleeds through; lower if quiet speakers get clipped. |
-| `_VAD_SILENCE_MS` | `600` | Consecutive noise/silence milliseconds required to flush the speech buffer. Matches `recorder.VAD_SILENCE_MS`. |
-| `_MAX_BUFFER_S` | `15.0` | Hard cap: flush the buffer at 15s even without silence detection (non-stop talker). |
+| `_SPEECH_ENERGY_THRESHOLD` | `0.02` | RMS gate: chunks below this are noise and discarded in LECTURE mode. Raise if background noise bleeds through; lower if quiet speakers get clipped. Not used in AWAITING_QUESTION path (uses adaptive threshold instead). |
+| `_VAD_SILENCE_MS` | `600` | Consecutive noise/silence milliseconds required to flush the speech buffer (LECTURE) or the question buffer (single-turn Ask AI). Matches `recorder.VAD_SILENCE_MS`. |
+| `_MAX_BUFFER_S` | `15.0` | Hard cap on LECTURE mode speech buffer: flush at 15s even without silence detection (non-stop talker). |
+| `_QA_MAX_WINDOW_S` | `20.0` | Hard cap on single-turn Ask AI question buffer. Flushes automatically after 20s regardless of silence — prevents indefinite hangs. |
+| `_QA_MIN_WINDOW_S` | `1.5` | Minimum seconds of audio that must accumulate before silence detection can trigger a flush. Prevents immediate flush before the prof starts speaking. |
+| `_AMBIENT_SPEECH_MULTIPLIER` | `2.5` | Adaptive silence threshold = `ambient_rms × 2.5`. Raise if end-of-question is being detected too aggressively; lower if silence detection fails in noisier rooms. |
+| `_AMBIENT_ALPHA` | `0.05` | EMA weight for ambient noise tracking during LECTURE mode. Lower = slower calibration. |
+
+**State dict keys** (carried on `gr.State`):
+
+| Key | Type | Role |
+|---|---|---|
+| `buffer` | `np.ndarray float32` | Accumulated speech for LECTURE mode transcription |
+| `qa_buffer` | `np.ndarray float32` | Accumulated audio for AWAITING_QUESTION |
+| `silence_samples` | `int` | Consecutive silence sample count (LECTURE mode) |
+| `paused` | `bool` | When True, all audio is dropped |
+| `ambient_rms` | `float` | Rolling ambient noise estimate, updated during LECTURE mode |
+| `qa_silence_samples` | `int` | Consecutive sub-threshold sample count (AWAITING_QUESTION single-turn) |
 
 ### recorder.py constants (imported but Silero VAD not used in live path)
 
@@ -242,13 +281,19 @@ All values verified against the actual code.
 | `CHUNK_SIZE` | `512` | Silero requirement. Not used in live path (Silero VAD not called). |
 | `MAX_SPEECH_SECONDS` | `30` | Defined in recorder.py. Replaced by `_MAX_BUFFER_S=15.0` in app.py. |
 
-### Q&A buffering (live_transcribe.py)
+### Q&A buffering (app.py + live_transcribe.py)
 
-| Parameter | Value | Note |
-|---|---|---|
-| `QA_BUFFER_SECONDS` | `4.0` | Part of the fixed capture window: audio accumulates for at least this long. |
-| `QA_TAIL_SECONDS` | `1.5` | Added to QA_BUFFER_SECONDS for total window. Trigger fires at 5.5s total. |
-| `QA_TRUNCATION_WAIT` | `2.0` | **Dead code in browser path.** Defined in live_transcribe.py but `push_question_audio()` does not call `_handle_question_utterance()` which used it. No truncation guard in current Q&A path. |
+The capture window for single-turn Ask AI is driven entirely by `app.py`'s `handle_audio_chunk()`. The `live_transcribe.py` constants are now unused in the single-turn path.
+
+| Parameter | Location | Value | Note |
+|---|---|---|---|
+| `_QA_MAX_WINDOW_S` | `app.py` | `20.0` | Hard cap — single-turn ask AI auto-flushes after 20s. Primary safety net. |
+| `_QA_MIN_WINDOW_S` | `app.py` | `1.5` | Silence detection doesn't fire until this many seconds of audio are buffered. |
+| `_AMBIENT_SPEECH_MULTIPLIER` | `app.py` | `2.5` | Adaptive threshold multiplier for silence detection during question capture. |
+| `_CONV_MAX_TURN_S` | `app.py` | `60.0` | Hard cap for conversation mode turns (Done speaking forgotten). |
+| `QA_BUFFER_SECONDS` | `live_transcribe.py` | `4.0` | **Unused in active paths.** Defined but not referenced by `push_question_audio()` or `handle_audio_chunk()`. |
+| `QA_TAIL_SECONDS` | `live_transcribe.py` | `1.5` | **Unused in active paths.** Was the old fixed-window tail; replaced by adaptive silence. |
+| `QA_TRUNCATION_WAIT` | `live_transcribe.py` | `2.0` | **Dead code.** Only used by `_handle_question_utterance()` which is also dead. |
 
 ### Vocabulary prompt (live_transcribe.py)
 
@@ -508,7 +553,11 @@ If transcription quality regresses, adjust in this order:
 
 5. **Silence flush not triggering** (transcript not updating during speech pauses) → lower `_SPEECH_ENERGY_THRESHOLD` so more frames count as "speech" and fewer advance the silence counter. Or lower `_VAD_SILENCE_MS` to flush sooner.
 
-6. **Q&A firing on question fragments** → raise `QA_BUFFER_SECONDS`. Trade-off: more perceived latency after clicking Ask AI.
+6. **Q&A flush fires before question is complete** → raise `_QA_MIN_WINDOW_S` (more audio required before silence can trigger) or raise `_AMBIENT_SPEECH_MULTIPLIER` (harder for silence to register as silence). "✓ Done Speaking" button is always the reliable fallback.
+
+   **Q&A flush never fires on silence (noisy room)** → lower `_AMBIENT_SPEECH_MULTIPLIER` toward 2.0. Check the PowerShell log line `[ASK AI] auto-flush (silence, Xs, thresh=Y)` to see what threshold is being used. If ambient_rms is high (e.g. 0.04), the multiplier needs to stay below `speech_rms / ambient_rms`.
+
+   **Q&A hangs with no flush at all** → 20s hard cap will always fire. If even that seems too slow, lower `_QA_MAX_WINDOW_S`.
 
 7. **Fabricated completions on speech that trails off** → add `temperature=0.0` to both `transcribe_audio()` in `live_transcribe.py` and `transcribe_file()` in `batch_transcribe.py`. Disables the temperature fallback chain entirely. Test with genuinely bad audio first.
 

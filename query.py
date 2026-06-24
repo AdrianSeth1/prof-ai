@@ -11,7 +11,7 @@ import logging
 import re
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from pathlib import Path
 from typing import Iterator
 
@@ -30,6 +30,7 @@ EMBED_MODEL = "nomic-embed-text"
 LLM_MODEL = "qwen3:30b-a3b"
 REFORMULATE_MODEL = "qwen3:14b"
 TOP_K = 6
+_SOURCE_TIMEOUT = 8  # seconds: max wall-clock time per literature source before it's abandoned
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 logger = logging.getLogger(__name__)
@@ -195,11 +196,15 @@ def search_literature(
     all_results: list[dict] = []
     with ThreadPoolExecutor(max_workers=len(sources)) as pool:
         futures = {pool.submit(_search_one, s): s for s in sources}
-        for fut in as_completed(futures):
-            source = futures[fut]
-            batch = fut.result()
-            print(f"[Literature] {source}: {len(batch)} result(s)", flush=True)
-            all_results.extend(batch)
+        try:
+            for fut in as_completed(futures, timeout=_SOURCE_TIMEOUT):
+                source = futures[fut]
+                batch = fut.result()
+                print(f"[Literature] {source}: {len(batch)} result(s)", flush=True)
+                all_results.extend(batch)
+        except FuturesTimeoutError:
+            slow = [s for f, s in futures.items() if not f.done()]
+            print(f"[Literature] timeout after {_SOURCE_TIMEOUT}s — abandoned: {slow}", flush=True)
 
     deduped = _dedupe_literature(all_results)
     print(f"[Literature] {len(deduped)} after dedup (from {len(all_results)} raw)", flush=True)
@@ -326,7 +331,7 @@ def query_stream(
         {"role": "system", "content": system},
         {"role": "user", "content": f"Context:\n\n{combined_context}{history_section}\n\nQuestion: {question}"},
     ]
-    for chunk in ollama.chat(model=LLM_MODEL, messages=messages, stream=True):
+    for chunk in ollama.chat(model=LLM_MODEL, messages=messages, stream=True, keep_alive="30m"):
         yield chunk["message"]["content"]
     yield {"sources": sources, "source_details": source_details, "literature": literature_results or []}
 

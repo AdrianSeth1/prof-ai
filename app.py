@@ -975,9 +975,15 @@ def chat_fn(
 # after VAD_SILENCE_MS of quiet.  Raise the threshold if background noise bleeds
 # through; lower it if a soft-spoken prof gets clipped.
 _VAD_SILENCE_MS = 600            # must match recorder.VAD_SILENCE_MS
-_SPEECH_ENERGY_THRESHOLD = 0.02  # RMS; above = speech, below = noise/silence
+_SPEECH_ENERGY_THRESHOLD = 0.02  # RMS; above = speech, below = noise/silence (lecture mode only)
 _MAX_BUFFER_S = 15.0             # hard cap: flush even if silence never fires
 _CONV_MAX_TURN_S = 60.0          # safety cap on conversation turn length (forgotten Done speaking)
+
+# Question-capture flush knobs (single-turn Ask AI only; conversation is separate)
+_QA_MAX_WINDOW_S = 20.0          # hard cap — flush even if silence never fires
+_QA_MIN_WINDOW_S = 1.5           # don't flush on silence until at least this many seconds recorded
+_AMBIENT_SPEECH_MULTIPLIER = 2.5 # adaptive speech threshold = ambient_rms * this
+_AMBIENT_ALPHA = 0.05            # EMA weight for ambient calibration (lower = slower tracking)
 
 
 def _resample_to_16k(audio: np.ndarray, src_rate: int) -> np.ndarray:
@@ -999,6 +1005,8 @@ def handle_audio_chunk(state: dict | None, audio_chunk) -> tuple:
             "qa_buffer": np.array([], dtype=np.float32),
             "silence_samples": 0,
             "paused": False,
+            "ambient_rms": 0.005,
+            "qa_silence_samples": 0,
         }
 
     if state.get("paused", False):
@@ -1022,6 +1030,14 @@ def handle_audio_chunk(state: dict | None, audio_chunk) -> tuple:
         chunk_rms = float(np.sqrt(np.mean(audio_16k ** 2)))
         silence_samples = state.get("silence_samples", 0)
 
+        # Track ambient noise floor passively. Update only when the chunk is
+        # below 3x current ambient (i.e., not speech), so speech events don't
+        # inflate the estimate. Used by the Q&A path for adaptive silence detection.
+        ambient = state.get("ambient_rms", 0.005)
+        if chunk_rms < ambient * 3.0:
+            ambient = (1 - _AMBIENT_ALPHA) * ambient + _AMBIENT_ALPHA * chunk_rms
+            ambient = max(0.001, min(ambient, 0.1))
+
         if chunk_rms >= _SPEECH_ENERGY_THRESHOLD:
             # Speech chunk: accumulate and reset silence counter
             buf = np.concatenate([state["buffer"], audio_16k])
@@ -1041,10 +1057,11 @@ def handle_audio_chunk(state: dict | None, audio_chunk) -> tuple:
             buf = np.array([], dtype=np.float32)
             silence_samples = 0
 
-        return {**state, "buffer": buf, "silence_samples": silence_samples}, poll_transcript()
+        return {**state, "buffer": buf, "silence_samples": silence_samples, "ambient_rms": ambient}, poll_transcript()
 
     elif mode == Mode.AWAITING_QUESTION:
         qa_buf = np.concatenate([state["qa_buffer"], audio_16k])
+
         if session.in_conversation:
             # Conversation mode: accumulate until "Done speaking" click.
             # Safety cap so a forgotten click flushes at _CONV_MAX_TURN_S.
@@ -1052,12 +1069,36 @@ def handle_audio_chunk(state: dict | None, audio_chunk) -> tuple:
                 print("[CONV] hard cap reached, auto-flushing turn", flush=True)
                 push_question_audio(qa_buf)
                 qa_buf = np.array([], dtype=np.float32)
+            return {**state, "qa_buffer": qa_buf}, gr.update()
         else:
-            # Single-turn Q&A: existing fixed-window behavior unchanged
-            if len(qa_buf) / 16000 >= QA_BUFFER_SECONDS + QA_TAIL_SECONDS:
+            # Single-turn Ask AI: adaptive silence detection + hard cap.
+            # Threshold calibrated against ambient level measured during lecture,
+            # so a noisy room doesn't prevent end-of-question detection.
+            ambient = state.get("ambient_rms", 0.005)
+            adaptive_thresh = max(0.005, ambient * _AMBIENT_SPEECH_MULTIPLIER)
+
+            chunk_rms = float(np.sqrt(np.mean(audio_16k ** 2)))
+            qa_silence_samples = state.get("qa_silence_samples", 0)
+            if chunk_rms < adaptive_thresh:
+                qa_silence_samples += len(audio_16k)
+            else:
+                qa_silence_samples = 0
+
+            buf_s = len(qa_buf) / 16000
+            qa_silence_ms = qa_silence_samples * 1000 / 16000
+
+            should_flush = (
+                buf_s >= _QA_MAX_WINDOW_S
+                or (buf_s >= _QA_MIN_WINDOW_S and qa_silence_ms >= _VAD_SILENCE_MS)
+            )
+            if should_flush:
+                reason = "hard cap" if buf_s >= _QA_MAX_WINDOW_S else "silence"
+                print(f"[ASK AI] auto-flush ({reason}, {buf_s:.1f}s, thresh={adaptive_thresh:.4f})", flush=True)
                 push_question_audio(qa_buf)
                 qa_buf = np.array([], dtype=np.float32)
-        return {**state, "qa_buffer": qa_buf}, gr.update()
+                qa_silence_samples = 0
+
+            return {**state, "qa_buffer": qa_buf, "qa_silence_samples": qa_silence_samples}, gr.update()
 
     else:  # Mode.PROCESSING — discard audio while handler runs
         return state, gr.update()
@@ -1075,6 +1116,8 @@ def stop_recording_audio(state: dict | None) -> tuple:
         "qa_buffer": np.array([], dtype=np.float32),
         "silence_samples": 0,
         "paused": False,
+        "ambient_rms": 0.005,
+        "qa_silence_samples": 0,
     }
     return empty, poll_transcript()
 
@@ -1082,14 +1125,16 @@ def stop_recording_audio(state: dict | None) -> tuple:
 def handle_pause(state: dict | None) -> tuple:
     """Flip the paused flag to True; audio accumulation stops until resume."""
     if state is None:
-        state = {"buffer": np.array([], dtype=np.float32), "qa_buffer": np.array([], dtype=np.float32), "silence_samples": 0, "paused": False}
+        state = {"buffer": np.array([], dtype=np.float32), "qa_buffer": np.array([], dtype=np.float32),
+                 "silence_samples": 0, "paused": False, "ambient_rms": 0.005, "qa_silence_samples": 0}
     return {**state, "paused": True}, gr.update(interactive=False), gr.update(interactive=True)
 
 
 def handle_resume(state: dict | None) -> tuple:
     """Flip the paused flag to False; audio accumulation resumes."""
     if state is None:
-        state = {"buffer": np.array([], dtype=np.float32), "qa_buffer": np.array([], dtype=np.float32), "silence_samples": 0, "paused": False}
+        state = {"buffer": np.array([], dtype=np.float32), "qa_buffer": np.array([], dtype=np.float32),
+                 "silence_samples": 0, "paused": False, "ambient_rms": 0.005, "qa_silence_samples": 0}
     return {**state, "paused": False}, gr.update(interactive=True), gr.update(interactive=False)
 
 
@@ -1242,6 +1287,8 @@ def start_recording(lecture_name: str, linked_docs: list[str]):
             "qa_buffer": np.array([], dtype=np.float32),
             "silence_samples": 0,
             "paused": False,
+            "ambient_rms": 0.005,
+            "qa_silence_samples": 0,
         }
         return (
             gr.update(interactive=False),  # start_btn
@@ -1278,6 +1325,7 @@ def stop_recording(state: dict | None):
         gr.update(interactive=False),  # stop_btn
         gr.update(choices=choices, value=choices[0][1] if choices else None),  # gap_dd
         gr.update(interactive=False),  # ask_ai_btn
+        gr.update(interactive=False),  # ask_ai_done_btn
         gr.update(interactive=False),  # cancel_btn
         None,                          # audio_state
         gr.update(interactive=False),  # pause_btn
@@ -1351,6 +1399,33 @@ def poll_qa_audio():
 def poll_cancel_btn() -> dict:
     session = get_current_session()
     active = session is not None and session.current_mode() != Mode.LECTURE
+    return gr.update(interactive=active)
+
+
+def ask_ai_done_fn(state: dict | None) -> tuple:
+    """Force-flush the accumulated question buffer for single-turn Ask AI."""
+    session = get_current_session()
+    if session is None or session.current_mode() != Mode.AWAITING_QUESTION or session.in_conversation:
+        return state, _get_status()
+    qa_buf = (state or {}).get("qa_buffer", np.array([], dtype=np.float32))
+    if len(qa_buf) > 0:
+        print("[ASK AI] Done speaking clicked — flushing question buffer", flush=True)
+        push_question_audio(qa_buf)
+        new_state = {**(state or {}), "qa_buffer": np.array([], dtype=np.float32), "qa_silence_samples": 0}
+        return new_state, "Processing question..."
+    else:
+        session.set_mode(Mode.LECTURE)
+        _set_status("● Recording lecture")
+        return state, "● Recording lecture"
+
+
+def poll_ask_ai_done_btn() -> dict:
+    session = get_current_session()
+    active = (
+        session is not None
+        and session.current_mode() == Mode.AWAITING_QUESTION
+        and not session.in_conversation
+    )
     return gr.update(interactive=active)
 
 
@@ -1452,7 +1527,7 @@ def done_speaking_fn(state: dict | None) -> tuple:
         # Empty buffer — nothing to transcribe, return to conversation idle
         session.set_mode(Mode.LECTURE)
         _set_status("● Conversation — ready")
-    new_state = {**state, "qa_buffer": np.array([], dtype=np.float32)} if state else state
+    new_state = {**state, "qa_buffer": np.array([], dtype=np.float32), "qa_silence_samples": 0} if state else state
     return (
         new_state,
         gr.update(interactive=False),  # speak_btn (poll will re-enable after PROCESSING)
@@ -1623,6 +1698,7 @@ def build_ui() -> gr.Blocks:
                 pause_btn = gr.Button("⏸ Pause Mic", interactive=False)
                 resume_btn = gr.Button("▶ Resume Mic", interactive=False)
                 ask_ai_btn = gr.Button("Ask AI", interactive=False)
+                ask_ai_done_btn = gr.Button("✓ Done Speaking", interactive=False)
                 cancel_btn = gr.Button("✕ Cancel", interactive=False)
             mic_audio = gr.Audio(
                 sources=["microphone"],
@@ -1683,6 +1759,7 @@ def build_ui() -> gr.Blocks:
             timer.tick(fn=poll_status, outputs=[status_box])
             timer.tick(fn=poll_qa_log, outputs=[qa_log_box])
             timer.tick(fn=poll_cancel_btn, outputs=[cancel_btn])
+            timer.tick(fn=poll_ask_ai_done_btn, outputs=[ask_ai_done_btn])
             timer.tick(fn=poll_qa_audio, outputs=[qa_audio])
             timer.tick(fn=poll_conv_display, outputs=[conv_display_box])
             timer.tick(fn=poll_conv_buttons, outputs=[speak_btn, done_btn])
@@ -1696,6 +1773,11 @@ def build_ui() -> gr.Blocks:
                 outputs=[linked_docs_dd],
             )
             ask_ai_btn.click(fn=ask_ai_fn, outputs=[status_box])
+            ask_ai_done_btn.click(
+                fn=ask_ai_done_fn,
+                inputs=[audio_state],
+                outputs=[audio_state, status_box],
+            )
             cancel_btn.click(fn=cancel_qa, outputs=[status_box])
             pause_btn.click(
                 fn=handle_pause,
@@ -1927,8 +2009,8 @@ def build_ui() -> gr.Blocks:
         stop_btn.click(
             fn=stop_recording,
             inputs=[audio_state],
-            outputs=[start_btn, stop_btn, gap_dd, ask_ai_btn, cancel_btn, audio_state,
-                     pause_btn, resume_btn, conv_start_btn, conv_end_btn],
+            outputs=[start_btn, stop_btn, gap_dd, ask_ai_btn, ask_ai_done_btn, cancel_btn,
+                     audio_state, pause_btn, resume_btn, conv_start_btn, conv_end_btn],
         )
 
     return demo
