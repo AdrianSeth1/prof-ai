@@ -34,8 +34,37 @@ THINK_OPEN = "<think>"
 THINK_CLOSE = "</think>"
 
 
-def parse_gap_findings(text: str) -> "list[dict] | None":
-    """Extract first JSON array from text. Tolerates code fences and leading prose."""
+def _normalise(s: str) -> str:
+    return re.sub(r'\s+', ' ', s.lower().strip())
+
+
+def _guard_coverage(findings: list[dict], transcript: str) -> list[dict]:
+    """Downgrade covered/partial to uncovered when evidence can't be found verbatim in transcript."""
+    tx_norm = _normalise(transcript)
+    guarded = []
+    for item in findings:
+        f = dict(item)
+        status = f.get("status", "uncovered")
+        # Strip surrounding quotes the model sometimes adds around the quote
+        evidence = (f.get("evidence") or "").strip().strip('"').strip("'").strip()
+        if status in ("covered", "partial"):
+            ev_norm = _normalise(evidence)
+            if len(ev_norm) < 8 or ev_norm not in tx_norm:
+                print(
+                    f"[GAP-GUARD] '{f.get('topic', '?')}' {status}→uncovered "
+                    f"({'empty evidence' if not ev_norm else repr(ev_norm[:60])})",
+                    flush=True,
+                )
+                f["status"] = "uncovered"
+                f["evidence"] = ""
+            else:
+                f["evidence"] = evidence
+        guarded.append(f)
+    return guarded
+
+
+def parse_gap_findings(text: str, transcript: str = "") -> "list[dict] | None":
+    """Extract first JSON array from text. With transcript, verifies evidence for covered/partial."""
     cleaned = re.sub(r'```(?:json)?\s*', '', text).replace('```', '')
     start = cleaned.find('[')
     if start == -1:
@@ -50,6 +79,8 @@ def parse_gap_findings(text: str) -> "list[dict] | None":
                 try:
                     data = json.loads(cleaned[start:i + 1])
                     if isinstance(data, list) and data:
+                        if transcript:
+                            data = _guard_coverage(data, transcript)
                         return data
                 except json.JSONDecodeError:
                     return None
@@ -247,27 +278,33 @@ def gaps_stream(session_id: str, show_thinking: bool = False) -> Iterator[str]:
         return
 
     doc_scope = (
-        f"Comparing specifically against: {', '.join(linked_docs)}\n\n"
+        f"Comparing against: {', '.join(linked_docs)}\n\n"
         if linked_docs else ""
     )
     prompt = (
-        "Below is a lecture transcript and the corresponding planned "
-        f"notes and slides for the same topic.\n\n{doc_scope}"
-        f"LECTURE TRANSCRIPT:\n{transcript}\n\n"
-        f"PLANNED NOTES AND SLIDES:\n{chunks_text}\n\n"
-        "Compare them carefully. For EVERY major topic, concept, or definition in "
-        "the notes/slides, determine whether the lecture covered it.\n\n"
-        "Return your answer as a JSON array. Each element must have exactly these keys:\n"
-        '  "topic"  - short topic name (string)\n'
-        '  "status" - one of: "covered", "partial", or "uncovered"\n'
-        '  "note"   - one sentence explaining the status; quote relevant source text if uncovered (string)\n'
-        '  "source" - the source filename from the chunk header (string)\n\n'
-        "Return ONLY the JSON array, no prose before or after it. Example:\n"
-        '[{"topic":"Resting membrane potential","status":"covered",'
-        '"note":"Lecturer explained -70 mV resting potential in detail.",'
-        '"source":"lecture1.pdf"}]\n'
-        "If everything was covered, still return the full JSON array with "
-        'status="covered" for each item.'
+        "You are auditing a lecture for coverage gaps. Be a strict fact-checker, not an optimistic summariser.\n\n"
+        "SOURCES AND THEIR ROLES:\n"
+        "  NOTES/SLIDES = planned curriculum (what the professor intended to cover)\n"
+        "  TRANSCRIPT   = the ONLY record of what was actually said in the lecture\n\n"
+        "COVERAGE RULES — follow these exactly:\n"
+        '  "covered"   — TRANSCRIPT explicitly discusses the topic. You MUST provide a verbatim quote.\n'
+        '  "partial"   — TRANSCRIPT mentions the topic but incompletely. Provide a verbatim quote.\n'
+        '  "uncovered" — TRANSCRIPT has no evidence of the topic. Leave evidence as empty string.\n\n'
+        "STRICT REQUIREMENTS:\n"
+        "  1. A topic is covered ONLY if the TRANSCRIPT says so — not because the slides mention it.\n"
+        "  2. For covered/partial you MUST quote exact words from the TRANSCRIPT.\n"
+        "  3. If you cannot find the words in the TRANSCRIPT, mark the topic uncovered.\n"
+        "  4. When in doubt, choose uncovered. Missing a gap is worse than a false alarm.\n\n"
+        f"{doc_scope}"
+        f"TRANSCRIPT (what was actually said):\n{transcript}\n\n"
+        f"NOTES/SLIDES (planned curriculum):\n{chunks_text}\n\n"
+        "Return a JSON array. Each item must have exactly these five keys:\n"
+        '  "topic"    — short topic name\n'
+        '  "status"   — "covered", "partial", or "uncovered"\n'
+        '  "note"     — one sentence on coverage or gap\n'
+        '  "evidence" — verbatim TRANSCRIPT quote for covered/partial; empty string "" for uncovered\n'
+        '  "source"   — filename from the NOTES/SLIDES chunk header\n\n'
+        "Return ONLY the JSON array. No text before or after it."
     )
     t0 = time.time()
     for token in _think_filter([{"role": "user", "content": prompt}], show_thinking):

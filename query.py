@@ -336,6 +336,68 @@ def query_stream(
     yield {"sources": sources, "source_details": source_details, "literature": literature_results or []}
 
 
+SYSTEM_PROMPT_COLLABORATE = (
+    "You are a teaching collaborator and co-instructor helping a professor develop and improve "
+    "their lecture. The course materials below give you context for the topic and what the "
+    "professor plans to teach. Be generative: offer fresh ideas, new examples, analogies, and "
+    "demonstrations; suggest clearer or alternative ways to explain a concept so it lands for "
+    "students; and when asked, teach the concept yourself, clearly and substantively. "
+    "Draw freely on your own subject knowledge — you are NOT limited to the source material "
+    "and do NOT need to cite sources or refuse when something isn't in the materials. "
+    "Be warm, collegial, and concrete. Stay accurate: if you're genuinely unsure of a fact, "
+    "say so rather than inventing it."
+)
+
+
+def collaborate_stream(
+    question: str,
+    doc_ids: list[str] | None = None,
+    conversation_history: str = "",
+) -> Iterator[str | dict]:
+    """Yield LLM tokens for Collaborate mode, then yield {"sources": [...], "literature": []}.
+
+    Reuses the same ChromaDB retrieval as query_stream but drives the teaching/ideation
+    system prompt instead. No literature search, no citation requirement.
+    Raises ValueError if the collection is unavailable.
+    """
+    if not CHROMA_DIR.exists():
+        raise ValueError("No chroma_db found. Run ingest.py first.")
+    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+    try:
+        collection = client.get_collection(COLLECTION_NAME)
+    except Exception:
+        raise ValueError(f'Collection "{COLLECTION_NAME}" not found.')
+    if collection.count() == 0:
+        raise ValueError("Collection is empty. Run ingest.py first.")
+
+    results = collection.query(
+        query_embeddings=[embed(question)],
+        n_results=min(TOP_K, collection.count()),
+        include=["documents", "metadatas"],
+        where=_build_where(None, doc_ids),
+    )
+    local_context, sources, source_details = build_context(results)
+
+    history_section = (
+        f"\n\n=== CONVERSATION HISTORY ===\n\n{conversation_history}"
+        if conversation_history else ""
+    )
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT_COLLABORATE},
+        {
+            "role": "user",
+            "content": (
+                f"Course material context:\n\n{local_context}"
+                f"{history_section}"
+                f"\n\nQuestion: {question}"
+            ),
+        },
+    ]
+    for chunk in ollama.chat(model=LLM_MODEL, messages=messages, stream=True, keep_alive="30m"):
+        yield chunk["message"]["content"]
+    yield {"sources": sources, "source_details": source_details, "literature": []}
+
+
 def resolve_session(args: argparse.Namespace) -> str | None:
     if args.session:
         return args.session

@@ -39,11 +39,11 @@ from module_store import (                                                     #
     create_module, rename_module, delete_module,
     assign_module_to_class, set_module_docs,
 )
-from query import query_stream, search_literature                               # noqa: E402
+from query import query_stream, search_literature, collaborate_stream           # noqa: E402
 from ingest import ingest_paths, extract_pdf, OCR_MIN_CHARS, get_collection    # noqa: E402
 from batch_transcribe import transcribe_file                                    # noqa: E402
 from manifest import load_manifest                                              # noqa: E402
-from gaps import gaps_stream, resolve_session_id as _resolve_session_id, parse_gap_findings  # noqa: E402
+from gaps import gaps_stream, resolve_session_id as _resolve_session_id, parse_gap_findings, load_transcript  # noqa: E402
 
 # Phase 5B: live lecture imports (importing live_transcribe also runs the
 # Windows NVIDIA DLL PATH fix at module load time — must stay before app init)
@@ -56,6 +56,7 @@ from session import Mode                                                        
 from qa import answer_question, answer_conversation_turn                         # noqa: E402
 from tts import PiperTTS                                                         # noqa: E402
 from live_gap import LiveGapWorker                                               # noqa: E402
+from artifacts import generate_artifacts as _generate_artifacts, list_artifacts  # noqa: E402
 
 # Minimum quality thresholds matching live_transcribe.py constants
 _MIN_WORDS = 2
@@ -224,6 +225,7 @@ class ChatRequest(BaseModel):
     selected: list[str] = []        # module IDs and/or bare filenames
     literature: list[str] = []      # subset of ["pubmed","semantic_scholar","openalex"]
     history: list[HistoryEntry] = []
+    mode: str = "research"          # "research" | "collaborate"
 
 
 def _format_history(history: list[HistoryEntry]) -> str:
@@ -254,30 +256,42 @@ async def chat(body: ChatRequest):
             doc_ids = expand_selection(body.selected) if body.selected else []
             conv_history = _format_history(body.history)
 
-            # Parallel literature search (blocking; runs in this thread)
-            lit_results: list[dict] = []
-            if body.literature:
-                lit_results = search_literature(
+            if body.mode == "collaborate":
+                print(
+                    f"[CHAT:collaborate] doc_ids={len(doc_ids) if doc_ids else 'all'}  "
+                    f"history={len(body.history)} turns",
+                    flush=True,
+                )
+                stream = collaborate_stream(
                     body.question,
-                    body.literature,
+                    doc_ids=doc_ids or None,
                     conversation_history=conv_history,
-                    selected_doc_titles=doc_ids,
-                    max_results=5,
+                )
+            else:
+                # research mode (default) — literature search + grounded RAG
+                lit_results: list[dict] = []
+                if body.literature:
+                    lit_results = search_literature(
+                        body.question,
+                        body.literature,
+                        conversation_history=conv_history,
+                        selected_doc_titles=doc_ids,
+                        max_results=5,
+                    )
+                print(
+                    f"[CHAT] doc_ids={len(doc_ids) if doc_ids else 'all'}  "
+                    f"lit={len(lit_results)} results  "
+                    f"history={len(body.history)} turns",
+                    flush=True,
+                )
+                stream = query_stream(
+                    body.question,
+                    doc_ids=doc_ids or None,
+                    literature_results=lit_results or None,
+                    conversation_history=conv_history,
                 )
 
-            print(
-                f"[CHAT] doc_ids={len(doc_ids) if doc_ids else 'all'}  "
-                f"lit={len(lit_results)} results  "
-                f"history={len(body.history)} turns",
-                flush=True,
-            )
-
-            for chunk in query_stream(
-                body.question,
-                doc_ids=doc_ids or None,          # None → no filter → all source docs
-                literature_results=lit_results or None,
-                conversation_history=conv_history,
-            ):
+            for chunk in stream:
                 if isinstance(chunk, dict):
                     line = json.dumps({"type": "done", **chunk}) + "\n"
                 elif chunk:                        # skip empty strings
@@ -669,10 +683,14 @@ async def ws_lecture(ws: WebSocket):
                 if gap_worker:
                     gap_worker.stop()
                     gap_worker = None
+                ended_id = session.session_id if session else None
                 if session:
                     stop_live_session()
                     session = None
-                await ws.send_text(json.dumps({"type": "stopped"}))
+                await ws.send_text(json.dumps({
+                    "type": "stopped",
+                    "session_id": ended_id,
+                }))
                 break
 
     except WebSocketDisconnect:
@@ -767,7 +785,11 @@ async def run_gaps(body: _GapsRequest):
             if pending:
                 content_buf += pending
 
-            findings = parse_gap_findings(content_buf)
+            try:
+                tx_for_guard = load_transcript(session_id)
+            except SystemExit:
+                tx_for_guard = ""
+            findings = parse_gap_findings(content_buf, transcript=tx_for_guard)
             enqueue({
                 "type": "done",
                 "session_id": session_id,
@@ -798,6 +820,76 @@ async def run_gaps(body: _GapsRequest):
             yield item
 
     return StreamingResponse(generate(), media_type="application/x-ndjson")
+
+
+# ── Artifact endpoints ────────────────────────────────────────────
+
+@app.post("/api/sessions/{session_id}/artifacts")
+async def run_artifacts(session_id: str):
+    """
+    Generate learning artifacts for a session. Streams NDJSON progress:
+      {"type":"progress","stage":"summary","message":"..."}
+      {"type":"progress","stage":"summary_done","message":"..."}
+      ... (coverage_report, study_guide, quiz, docx)
+      {"type":"done","files":[{"label":"...","name":"...","url":"..."},...]}
+      {"type":"error","message":"..."}
+    """
+    loop  = asyncio.get_event_loop()
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+    def blocking_work() -> None:
+        def enqueue(obj: dict) -> None:
+            loop.call_soon_threadsafe(queue.put_nowait, json.dumps(obj) + "\n")
+
+        def on_progress(stage: str, message: str) -> None:
+            enqueue({"type": "progress", "stage": stage, "message": message})
+
+        try:
+            files = _generate_artifacts(session_id, on_progress=on_progress)
+            enqueue({"type": "done", "files": files})
+        except ValueError as exc:
+            enqueue({"type": "error", "message": str(exc)})
+        except Exception as exc:
+            import traceback
+            print(f"[ARTIFACTS] Error:\n{traceback.format_exc()}", flush=True)
+            enqueue({"type": "error", "message": str(exc)})
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+
+    async def generate():
+        future = loop.run_in_executor(_THREAD_POOL, blocking_work)
+        while True:
+            item = await queue.get()
+            if item is None:
+                try:
+                    await future
+                except Exception:
+                    pass
+                return
+            yield item
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
+
+
+@app.get("/api/sessions/{session_id}/artifacts")
+async def get_artifact_list(session_id: str):
+    """Return list of generated artifact files, or [] if none exist yet."""
+    return {"files": list_artifacts(session_id)}
+
+
+@app.get("/api/sessions/{session_id}/artifacts/{filename}")
+async def download_artifact(session_id: str, filename: str):
+    """Download a specific artifact file."""
+    from fastapi.responses import FileResponse
+    # Sanitise: reject any path traversal
+    if "/" in filename or "\\" in filename or filename.startswith("."):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    path = Path("exports") / session_id / filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    media = "application/vnd.openxmlformats-officedocument.wordprocessingml.document" \
+        if filename.endswith(".docx") else "text/markdown; charset=utf-8"
+    return FileResponse(str(path), media_type=media, filename=filename)
 
 
 # ── Ingest endpoint (Phase 2) ─────────────────────────────────────

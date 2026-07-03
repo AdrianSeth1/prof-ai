@@ -110,6 +110,14 @@ const MODE_LABEL: Record<UIMode, string> = {
   paused:     '⏸ Paused',
 }
 
+const ARTIFACT_STAGES: { key: string; label: string }[] = [
+  { key: 'summary',         label: 'Lecture summary'  },
+  { key: 'coverage_report', label: 'Coverage report'  },
+  { key: 'study_guide',     label: 'Study guide'      },
+  { key: 'quiz',            label: 'Quiz'             },
+  { key: 'docx',            label: 'DOCX export'      },
+]
+
 function SourceChip({ src }: { src: string }) {
   return (
     <span style={{
@@ -162,6 +170,13 @@ export default function LiveLecture({ onToast }: Props) {
   const [connecting, setConnecting]           = useState<boolean>(false)
   const [threshold, setThreshold]             = useState<number>(0.012)
   const [showReasoning, setShowReasoning]     = useState<boolean>(false)
+  // Artifact generation state (shown after session ends, before next session starts)
+  const [artifactState, setArtifactState]     = useState<'idle' | 'generating' | 'done' | 'error'>('idle')
+  const [artifactStages, setArtifactStages]   = useState<Set<string>>(new Set())
+  const [artifactActiveStage, setArtifactActiveStage] = useState<string | null>(null)
+  const [artifactFiles, setArtifactFiles]     = useState<{label: string; name: string; url: string}[]>([])
+  const [artifactError, setArtifactError]     = useState<string | null>(null)
+  const [artifactSessionId, setArtifactSessionId] = useState<string | null>(null)
 
   // Fetch modules + docs for the pre-start picker
   useEffect(() => {
@@ -234,6 +249,74 @@ export default function LiveLecture({ onToast }: Props) {
     }
   }, [])
 
+  // ── Artifact generation ─────────────────────────────────────────
+  const generateArtifacts = useCallback(async (sessId: string) => {
+    setArtifactState('generating')
+    setArtifactStages(new Set())
+    setArtifactActiveStage('summary')
+    setArtifactFiles([])
+    setArtifactError(null)
+
+    let settled = false
+
+    try {
+      const r = await fetch(`/api/sessions/${sessId}/artifacts`, { method: 'POST' })
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}))
+        throw new Error((err as { detail?: string }).detail ?? `HTTP ${r.status}`)
+      }
+      const reader = r.body!.getReader()
+      const dec = new TextDecoder()
+      let buf = ''
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += dec.decode(value, { stream: true })
+        const lines = buf.split('\n')
+        buf = lines.pop() ?? ''
+        for (const line of lines) {
+          if (!line.trim()) continue
+          try {
+            const msg = JSON.parse(line) as {
+              type: string; stage?: string; message?: string;
+              files?: {label: string; name: string; url: string}[]
+            }
+            if (msg.type === 'progress' && msg.stage) {
+              if (msg.stage.endsWith('_done')) {
+                const base = msg.stage.replace('_done', '')
+                setArtifactStages(prev => new Set([...prev, base]))
+                setArtifactActiveStage(null)
+              } else if (msg.stage !== 'done') {
+                setArtifactActiveStage(msg.stage)
+              }
+            } else if (msg.type === 'done') {
+              setArtifactFiles(msg.files ?? [])
+              setArtifactState('done')
+              settled = true
+            } else if (msg.type === 'error') {
+              setArtifactError(msg.message ?? 'Unknown error')
+              setArtifactState('error')
+              settled = true
+            }
+          } catch { /* ignore malformed NDJSON lines */ }
+        }
+      }
+      if (!settled) setArtifactState('done')
+    } catch (err) {
+      setArtifactError(err instanceof Error ? err.message : String(err))
+      setArtifactState('error')
+    }
+  }, [])
+
+  const resetArtifacts = useCallback(() => {
+    setArtifactState('idle')
+    setArtifactStages(new Set())
+    setArtifactActiveStage(null)
+    setArtifactFiles([])
+    setArtifactError(null)
+    setArtifactSessionId(null)
+  }, [])
+
   // ── WS message handler ──────────────────────────────────────────
   const handleWsMessage = useCallback((ev: MessageEvent) => {
     if (ev.data instanceof ArrayBuffer) {
@@ -291,6 +374,7 @@ export default function LiveLecture({ onToast }: Props) {
       setGapTs((msg.ts as string | null) ?? null)
 
     } else if (type === 'stopped') {
+      const endedId = (msg.session_id as string | undefined) ?? null
       stopAudio()
       setSessionInfo(null)
       setSegments([])
@@ -302,12 +386,16 @@ export default function LiveLecture({ onToast }: Props) {
       setGapTs(null)
       setUiMode('lecture')
       onToast('Session ended')
+      if (endedId) {
+        setArtifactSessionId(endedId)
+        generateArtifacts(endedId)
+      }
 
     } else if (type === 'error') {
       onToast('Error', (msg.message as string) || 'Unknown error')
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [handleTtsAudio, onToast])
+  }, [handleTtsAudio, onToast, generateArtifacts])
 
   // ── Audio teardown ──────────────────────────────────────────────
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -459,6 +547,141 @@ export default function LiveLecture({ onToast }: Props) {
   }, [])
 
   const canAskAI = sessionInfo !== null && (uiMode === 'lecture' || uiMode === 'paused')
+
+  // ── Post-session artifact panel ──────────────────────────────────
+  if (!sessionInfo && artifactState !== 'idle') {
+    return (
+      <div style={{
+        height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center',
+        padding: 32,
+      }}>
+        <div style={{
+          width: '100%', maxWidth: 540,
+          background: 'var(--bg-surface)', border: '1px solid var(--border)',
+          borderRadius: 12, padding: 32,
+          display: 'flex', flexDirection: 'column', gap: 22,
+        }}>
+          {/* Header */}
+          <div>
+            <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--fg-base)', marginBottom: 4 }}>
+              {artifactState === 'done' ? 'Session artifacts ready' :
+               artifactState === 'error' ? 'Artifact generation failed' :
+               'Generating session artifacts…'}
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--fg-muted)' }}>
+              {artifactState === 'done'
+                ? `Files saved to exports/${artifactSessionId ?? ''}`
+                : artifactState === 'error'
+                ? 'Generation stopped — see error below'
+                : 'This takes 1–3 minutes. You can start a new session while this runs.'}
+            </div>
+          </div>
+
+          {/* Stage list */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {ARTIFACT_STAGES.map(stage => {
+              const isDone   = artifactStages.has(stage.key)
+              const isActive = artifactActiveStage === stage.key
+              return (
+                <div key={stage.key} style={{
+                  display: 'flex', alignItems: 'center', gap: 10,
+                  padding: '8px 12px',
+                  background: isDone ? 'rgba(78,201,133,0.08)' : isActive ? 'rgba(94,106,210,0.10)' : 'var(--bg-base)',
+                  border: `1px solid ${isDone ? 'rgba(78,201,133,0.22)' : isActive ? 'rgba(94,106,210,0.32)' : 'var(--border)'}`,
+                  borderRadius: 7,
+                  transition: 'background 200ms, border-color 200ms',
+                }}>
+                  <div style={{ width: 18, height: 18, flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    {isDone ? (
+                      <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="#4ec985" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M3 8.5l3.2 3.2L13 4.5" />
+                      </svg>
+                    ) : isActive ? (
+                      <span className="animate-spin-slow" style={{ display: 'inline-flex' }}>
+                        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="var(--accent)" strokeWidth="1.8">
+                          <circle cx="8" cy="8" r="5.5" strokeDasharray="25" strokeDashoffset="10" />
+                        </svg>
+                      </span>
+                    ) : (
+                      <div style={{ width: 5, height: 5, borderRadius: '50%', background: 'rgba(255,255,255,0.2)' }} />
+                    )}
+                  </div>
+                  <span style={{
+                    fontSize: 13,
+                    color: isDone ? '#4ec985' : isActive ? 'var(--fg-base)' : 'var(--fg-muted)',
+                    fontWeight: isActive ? 600 : 400,
+                  }}>
+                    {stage.label}
+                  </span>
+                </div>
+              )
+            })}
+          </div>
+
+          {/* Download buttons */}
+          {artifactState === 'done' && artifactFiles.length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              <div style={{
+                fontSize: 10, fontWeight: 700, letterSpacing: '0.08em',
+                textTransform: 'uppercase', color: 'var(--fg-muted)',
+              }}>
+                Downloads
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7 }}>
+                {artifactFiles.map(f => (
+                  <a
+                    key={f.name}
+                    href={f.url}
+                    download={f.name}
+                    style={{
+                      display: 'inline-flex', alignItems: 'center', gap: 5,
+                      padding: '6px 11px',
+                      background: 'var(--accent)', borderRadius: 6,
+                      color: '#fff', fontSize: 12, fontWeight: 600,
+                      textDecoration: 'none',
+                    }}
+                  >
+                    <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M8 2v8m0 0l-3-3m3 3l3-3M2 13h12" />
+                    </svg>
+                    {f.label}
+                  </a>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Error details */}
+          {artifactState === 'error' && artifactError && (
+            <div style={{
+              padding: '10px 12px',
+              background: 'rgba(239,77,86,0.08)',
+              border: '1px solid rgba(239,77,86,0.25)',
+              borderRadius: 7, fontSize: 12, color: 'var(--rec-text)',
+            }}>
+              {artifactError}
+            </div>
+          )}
+
+          {/* Start new session */}
+          <button
+            onClick={resetArtifacts}
+            disabled={artifactState === 'generating'}
+            style={{
+              background: artifactState === 'generating' ? 'rgba(94,106,210,0.2)' : 'var(--accent)',
+              border: 'none', borderRadius: 6, padding: '10px 20px',
+              color: artifactState === 'generating' ? 'var(--fg-muted)' : '#fff',
+              fontSize: 13, fontWeight: 600,
+              cursor: artifactState === 'generating' ? 'default' : 'pointer',
+              fontFamily: 'inherit', transition: 'background 120ms',
+            }}
+          >
+            {artifactState === 'generating' ? 'Generating…' : '▶ Start New Session'}
+          </button>
+        </div>
+      </div>
+    )
+  }
 
   // ── Pre-start panel ─────────────────────────────────────────────
   if (!sessionInfo) {
@@ -732,11 +955,13 @@ export default function LiveLecture({ onToast }: Props) {
           <div style={{
             margin: currentAnswer ? '0 12px 0 12px' : '12px 12px 0 12px',
             border: '1px solid var(--border)', borderRadius: 8,
-            overflow: 'hidden', flexShrink: 0,
+            overflow: 'hidden',
+            display: 'flex', flexDirection: 'column', minHeight: 0,
           }}>
             <button
               onClick={() => setGapsOpen(v => !v)}
               style={{
+                flexShrink: 0,
                 width: '100%', padding: '9px 14px',
                 background: 'var(--bg-surface)', border: 'none', cursor: 'pointer',
                 display: 'flex', alignItems: 'center', justifyContent: 'space-between',
@@ -755,11 +980,11 @@ export default function LiveLecture({ onToast }: Props) {
             </button>
             {gapsOpen && (
               <div style={{
-                padding: '10px 14px', borderTop: '1px solid var(--border)',
-                maxHeight: 200, overflowY: 'auto',
+                padding: '10px 12px', borderTop: '1px solid var(--border)',
+                maxHeight: 364, overflowY: 'auto',
               }}>
                 {gapFindings ? (
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
                     {gapFindings.map((f, i) => <FindingCard key={i} finding={f} />)}
                   </div>
                 ) : gapRaw ? (

@@ -73,17 +73,24 @@ def live_gaps_stream(transcript: str, linked_docs: list[str]) -> Iterator[str]:
 
     doc_scope = f"Comparing against: {', '.join(linked_docs)}\n\n" if linked_docs else ""
     prompt = (
-        "You are reviewing a lecture in progress. Be concise.\n\n"
+        "You are auditing a live lecture for coverage gaps. Be a strict fact-checker.\n\n"
+        "SOURCES:\n"
+        "  NOTES/SLIDES      = planned curriculum\n"
+        "  RECENT TRANSCRIPT = the ONLY record of what was said in this lecture portion\n\n"
+        "COVERAGE RULES:\n"
+        '  "covered"   — TRANSCRIPT explicitly discusses the topic. Quote the exact words.\n'
+        '  "partial"   — TRANSCRIPT mentions it but incompletely. Quote what was said.\n'
+        '  "uncovered" — No evidence in TRANSCRIPT. Leave evidence as empty string.\n'
+        "  When in doubt, choose uncovered. Do NOT infer coverage from the slides.\n\n"
         f"{doc_scope}"
-        f"RECENT LECTURE CONTENT:\n{transcript}\n\n"
+        f"RECENT TRANSCRIPT:\n{transcript}\n\n"
         f"NOTES/SLIDES:\n{chunks}\n\n"
-        "For each major topic in the notes/slides, determine if it was covered in the "
-        "recent lecture content. Return a JSON array. Each item must have these keys:\n"
-        '  "topic"  - short topic name\n'
-        '  "status" - "covered", "partial", or "uncovered"\n'
-        '  "note"   - one sentence (be brief)\n'
-        '  "source" - the source filename from the chunk header\n\n'
-        "Return ONLY the JSON array, no other text."
+        "Return a JSON array (no other text). Each item must have exactly these keys:\n"
+        '  "topic"    — short topic name\n'
+        '  "status"   — "covered", "partial", or "uncovered"\n'
+        '  "note"     — one sentence on coverage or gap\n'
+        '  "evidence" — verbatim TRANSCRIPT quote for covered/partial; empty string "" for uncovered\n'
+        '  "source"   — filename from the NOTES/SLIDES chunk header'
     )
     for chunk in ollama.chat(
         model=LLM_MODEL,
@@ -147,6 +154,7 @@ class LiveGapWorker:
             delta = delta[-MAX_TRANSCRIPT_CHARS:]
         self._last_segment_count = len(session.segments)
 
+        full_tx = " ".join(seg["text"] for seg in session.segments)
         result = ""
         t0 = time.time()
         try:
@@ -156,5 +164,5 @@ class LiveGapWorker:
             result = f"⚠ {e}"
         print(f"[GAP-LIVE] llm {time.time() - t0:.1f}s", flush=True)
         session.latest_gap_analysis = result
-        findings = parse_gap_findings(result)
+        findings = parse_gap_findings(result, transcript=full_tx)
         self._on_result(findings if findings is not None else result, datetime.now())

@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 import SourceFilter from '../components/SourceFilter'
 import type { SourceData } from '../components/SourceFilter'
 
 // ── Local types ───────────────────────────────────────────────────
+
+type ChatMode = 'research' | 'collaborate'
 
 interface SourceDetail { source_file: string; location: string; preview: string }
 interface LitItem {
@@ -124,7 +126,7 @@ function ShimmerLine({ w }: { w: string }) {
 
 // ── Message row ───────────────────────────────────────────────────
 
-function MsgRow({ msg }: { msg: ChatMsg }) {
+function MsgRow({ msg, mode }: { msg: ChatMsg; mode: ChatMode }) {
   const isUser = msg.role === 'user'
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
@@ -141,13 +143,17 @@ function MsgRow({ msg }: { msg: ChatMsg }) {
           ) : (
             <div style={{
               width: 22, height: 22, borderRadius: 6,
-              background: 'linear-gradient(150deg,#6e79e0,#5059bd)',
+              background: mode === 'collaborate'
+                ? 'linear-gradient(150deg,#e9a23b,#c47d10)'
+                : 'linear-gradient(150deg,#6e79e0,#5059bd)',
               flexShrink: 0,
               boxShadow: '0 0 0 1px rgba(255,255,255,0.06) inset',
             }} />
           )
         }
-        <span style={{ fontSize: 12.5, fontWeight: 600 }}>{isUser ? 'You' : 'Prof AI'}</span>
+        <span style={{ fontSize: 12.5, fontWeight: 600 }}>
+          {isUser ? 'You' : mode === 'collaborate' ? 'Collaborator' : 'Prof AI'}
+        </span>
         <span style={{ fontFamily: '"JetBrains Mono",monospace', fontSize: 10.5, color: 'var(--text-faint)' }}>
           {msg.time}
         </span>
@@ -172,7 +178,8 @@ function MsgRow({ msg }: { msg: ChatMsg }) {
             <div style={{ fontSize: 14, color: 'var(--text-body)', lineHeight: 1.68, whiteSpace: 'pre-wrap' }}>
               {msg.text}
             </div>
-            {msg.kind === 'answer' && msg.chips && msg.chips.length > 0 && (
+            {/* Only show citation chips in research mode — collaborate sends none */}
+            {msg.kind === 'answer' && mode === 'research' && msg.chips && msg.chips.length > 0 && (
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, alignItems: 'center' }}>
                 {msg.chips.map((c, i) => <CitationChip key={i} chip={c} />)}
               </div>
@@ -225,9 +232,54 @@ function LitToggle({ label, active, onClick }: { label: string; active: boolean;
   )
 }
 
+// ── Mode toggle (segmented control) ──────────────────────────────
+
+function ModeToggle({ mode, onChange }: { mode: ChatMode; onChange: (m: ChatMode) => void }) {
+  return (
+    <div style={{
+      display: 'inline-flex', alignItems: 'center',
+      padding: 3, gap: 2,
+      background: 'rgba(255,255,255,0.05)',
+      borderRadius: 9, flexShrink: 0,
+    }}>
+      {(['research', 'collaborate'] as ChatMode[]).map(m => (
+        <button
+          key={m}
+          onClick={() => onChange(m)}
+          style={{
+            height: 24, padding: '0 11px',
+            borderRadius: 6, border: 'none',
+            background: mode === m ? 'var(--bg-base)' : 'transparent',
+            color: mode === m ? 'var(--text)' : 'var(--text-faint)',
+            fontSize: 11.5, fontWeight: mode === m ? 500 : 400,
+            cursor: 'pointer', fontFamily: 'inherit',
+            boxShadow: mode === m ? '0 1px 3px rgba(0,0,0,0.35)' : 'none',
+            transition: 'background 120ms ease, color 120ms ease, box-shadow 120ms ease',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {m === 'research' ? 'Research' : 'Collaborate'}
+        </button>
+      ))}
+    </div>
+  )
+}
+
 // ── Main Chat screen ──────────────────────────────────────────────
 
 export default function Chat() {
+  const [mode, setModeRaw] = useState<ChatMode>(() => {
+    try {
+      const stored = localStorage.getItem('profai_chat_mode')
+      return (stored === 'collaborate' || stored === 'research') ? stored : 'research'
+    } catch { return 'research' }
+  })
+
+  const setMode = useCallback((m: ChatMode) => {
+    setModeRaw(m)
+    try { localStorage.setItem('profai_chat_mode', m) } catch { /* private browsing */ }
+  }, [])
+
   const [sources, setSources]       = useState<SourceData>({ modules: [], documents: [] })
   const [selected, setSelected]     = useState<Set<string>>(new Set())
   const [lit, setLit]               = useState({ pubmed: true, semantic_scholar: true, openalex: false })
@@ -276,18 +328,18 @@ export default function Chat() {
     const q = chatInput.trim()
     if (!q || streaming) return
 
-    // Snapshot history from current messages BEFORE appending the new ones
     const history = historyFrom(messages)
-    // Compute active lit sources from current lit state (avoids stale closure)
-    const activeLitNow = Object.entries(lit).filter(([, v]) => v).map(([k]) => k)
+    const activeLit = mode === 'research'
+      ? Object.entries(lit).filter(([, v]) => v).map(([k]) => k)
+      : []
 
     setChatInput('')
     setStreaming(true)
     setChunkCount(null)
 
     const t    = stamp()
-    const umid = uid()  // user message id — generated outside updater (Strict Mode safe)
-    const amid = uid()  // assistant message id
+    const umid = uid()
+    const amid = uid()
     setMessages(prev => [
       ...prev,
       { id: umid, role: 'user',      kind: 'user',     text: q, time: t },
@@ -301,8 +353,9 @@ export default function Chat() {
         body: JSON.stringify({
           question:   q,
           selected:   [...selected],
-          literature: activeLitNow,
+          literature: activeLit,
           history,
+          mode,
         }),
       })
 
@@ -369,11 +422,19 @@ export default function Chat() {
       setStreaming(false)
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chatInput, streaming, selected, lit, messages])
+  }, [chatInput, streaming, selected, lit, messages, mode])
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() }
   }
+
+  const placeholder = mode === 'collaborate'
+    ? 'Ask for ideas, examples, or to be taught…'
+    : 'Ask about the course materials or literature…'
+
+  const footerRight = chunkCount !== null
+    ? `${mode === 'collaborate' ? 'Collaborate' : 'RAG'} · qwen3 · ${chunkCount} chunk${chunkCount !== 1 ? 's' : ''}`
+    : mode === 'collaborate' ? 'Collaborate · qwen3' : 'RAG · qwen3'
 
   // ── Render ──────────────────────────────────────────────────────
   return (
@@ -394,6 +455,12 @@ export default function Chat() {
           display: 'flex', alignItems: 'center', gap: 9, flexWrap: 'wrap',
         }}>
 
+          {/* Mode toggle — leftmost */}
+          <ModeToggle mode={mode} onChange={setMode} />
+
+          {/* Divider */}
+          <div style={{ width: 1, height: 18, background: 'rgba(255,255,255,0.08)', flexShrink: 0 }} />
+
           {/* Scope dropdown */}
           <SourceFilter
             sources={sources}
@@ -401,31 +468,33 @@ export default function Chat() {
             onToggle={toggleItem}
           />
 
-          {/* Divider */}
-          <div style={{ width: 1, height: 18, background: 'rgba(255,255,255,0.08)', flexShrink: 0 }} />
-
-          {/* Literature label + toggles */}
-          <span style={{
-            fontFamily: '"JetBrains Mono",monospace',
-            fontSize: 10.5, color: 'var(--text-faint)',
-          }}>literature</span>
-          <LitToggle label="PubMed"           active={lit.pubmed}           onClick={() => setLit(l => ({ ...l, pubmed: !l.pubmed }))} />
-          <LitToggle label="Semantic Scholar"  active={lit.semantic_scholar} onClick={() => setLit(l => ({ ...l, semantic_scholar: !l.semantic_scholar }))} />
-          <LitToggle label="OpenAlex"          active={lit.openalex}         onClick={() => setLit(l => ({ ...l, openalex: !l.openalex }))} />
+          {/* Literature toggles — research mode only */}
+          {mode === 'research' && (
+            <>
+              <div style={{ width: 1, height: 18, background: 'rgba(255,255,255,0.08)', flexShrink: 0 }} />
+              <span style={{
+                fontFamily: '"JetBrains Mono",monospace',
+                fontSize: 10.5, color: 'var(--text-faint)',
+              }}>literature</span>
+              <LitToggle label="PubMed"           active={lit.pubmed}           onClick={() => setLit(l => ({ ...l, pubmed: !l.pubmed }))} />
+              <LitToggle label="Semantic Scholar"  active={lit.semantic_scholar} onClick={() => setLit(l => ({ ...l, semantic_scholar: !l.semantic_scholar }))} />
+              <LitToggle label="OpenAlex"          active={lit.openalex}         onClick={() => setLit(l => ({ ...l, openalex: !l.openalex }))} />
+            </>
+          )}
         </div>
       </div>
 
       {/* ── Message thread ── */}
       <div ref={threadRef} style={{ flex: 1, overflowY: 'auto' }}>
         {messages.length === 0
-          ? <EmptyState />
+          ? (mode === 'collaborate' ? <CollaborateEmptyState /> : <ResearchEmptyState />)
           : (
             <div style={{
               maxWidth: 840, margin: '0 auto', width: '100%',
               padding: '26px 24px 8px',
               display: 'flex', flexDirection: 'column', gap: 26,
             }}>
-              {messages.map(m => <MsgRow key={m.id} msg={m} />)}
+              {messages.map(m => <MsgRow key={m.id} msg={m} mode={mode} />)}
             </div>
           )
         }
@@ -439,7 +508,9 @@ export default function Chat() {
             onBlur={() => setComposerFocus(false)}
             style={{
               display: 'flex', alignItems: 'flex-end', gap: 9,
-              border: `1px solid ${composerFocus ? 'rgba(94,106,210,0.5)' : 'rgba(255,255,255,0.12)'}`,
+              border: `1px solid ${composerFocus
+                ? mode === 'collaborate' ? 'rgba(233,162,59,0.45)' : 'rgba(94,106,210,0.5)'
+                : 'rgba(255,255,255,0.12)'}`,
               borderRadius: 12,
               background: '#101114',
               padding: '9px 9px 9px 14px',
@@ -451,7 +522,7 @@ export default function Chat() {
               value={chatInput}
               onChange={e => setChatInput(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder="Ask about the course materials or literature…"
+              placeholder={placeholder}
               rows={1}
               style={{
                 flex: 1, background: 'transparent', border: 'none',
@@ -462,7 +533,11 @@ export default function Chat() {
                 overflow: chatInput.split('\n').length > 3 ? 'auto' : 'hidden',
               }}
             />
-            <SendButton onClick={send} disabled={!chatInput.trim() || streaming} />
+            <SendButton
+              onClick={send}
+              disabled={!chatInput.trim() || streaming}
+              collaborate={mode === 'collaborate'}
+            />
           </div>
 
           <div style={{
@@ -473,12 +548,7 @@ export default function Chat() {
           }}>
             <KbdChip>⏎</KbdChip> send
             <KbdChip style={{ marginLeft: 4 }}>⇧⏎</KbdChip> newline
-            <span style={{ marginLeft: 'auto' }}>
-              {chunkCount !== null
-                ? `RAG · qwen3 · ${chunkCount} chunk${chunkCount !== 1 ? 's' : ''} retrieved`
-                : 'RAG · qwen3'
-              }
-            </span>
+            <span style={{ marginLeft: 'auto' }}>{footerRight}</span>
           </div>
         </div>
       </div>
@@ -489,8 +559,10 @@ export default function Chat() {
 
 // ── Small sub-components ──────────────────────────────────────────
 
-function SendButton({ onClick, disabled }: { onClick: () => void; disabled: boolean }) {
+function SendButton({ onClick, disabled, collaborate }: { onClick: () => void; disabled: boolean; collaborate?: boolean }) {
   const [hov, setHov] = useState(false)
+  const accent = collaborate ? '#c47d10' : 'var(--accent)'
+  const accentHov = collaborate ? '#d48f20' : 'var(--accent-hover)'
   return (
     <button
       onClick={onClick}
@@ -501,7 +573,9 @@ function SendButton({ onClick, disabled }: { onClick: () => void; disabled: bool
         width: 34, height: 34, flexShrink: 0,
         borderRadius: 8, border: 'none',
         cursor: disabled ? 'not-allowed' : 'pointer',
-        background: disabled ? 'rgba(94,106,210,0.35)' : hov ? 'var(--accent-hover)' : 'var(--accent)',
+        background: disabled
+          ? collaborate ? 'rgba(196,125,16,0.30)' : 'rgba(94,106,210,0.35)'
+          : hov ? accentHov : accent,
         color: '#fff',
         display: 'flex', alignItems: 'center', justifyContent: 'center',
         transition: 'background 140ms ease',
@@ -525,7 +599,7 @@ function KbdChip({ children, style }: { children: React.ReactNode; style?: React
   )
 }
 
-function EmptyState() {
+function ResearchEmptyState() {
   return (
     <div style={{
       height: '100%', display: 'flex',
@@ -550,6 +624,37 @@ function EmptyState() {
         </div>
         <div style={{ fontSize: 12.5, color: 'var(--text-muted)', lineHeight: 1.6, maxWidth: 300 }}>
           Search course materials and recent literature. Select sources above to scope retrieval.
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function CollaborateEmptyState() {
+  return (
+    <div style={{
+      height: '100%', display: 'flex',
+      alignItems: 'center', justifyContent: 'center',
+      padding: 32,
+    }}>
+      <div style={{ textAlign: 'center' }}>
+        <div style={{
+          width: 40, height: 40, borderRadius: 10,
+          background: 'rgba(196,125,16,0.12)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          margin: '0 auto 14px',
+        }}>
+          <svg width="20" height="20" viewBox="0 0 16 16" fill="none" stroke="var(--await)"
+            strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M2.5 8.5l3.5-5.5 2.5 4 2-2.5 3 4H2.5z" />
+            <circle cx="12" cy="4" r="1" fill="var(--await)" stroke="none" />
+          </svg>
+        </div>
+        <div style={{ fontSize: 14, fontWeight: 500, color: 'var(--text-soft)', marginBottom: 8 }}>
+          Teaching collaborator
+        </div>
+        <div style={{ fontSize: 12.5, color: 'var(--text-muted)', lineHeight: 1.75, maxWidth: 320 }}>
+          Ask for a fresh analogy or example · get a concept explained a different way · brainstorm how to teach a hard section · explore ideas beyond what's in the slides
         </div>
       </div>
     </div>

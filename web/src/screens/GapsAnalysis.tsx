@@ -280,6 +280,9 @@ function ScopeChip({ filename }: { filename: string }) {
 
 // ── Main component ────────────────────────────────────────────────
 
+interface ArtifactFile { label: string; name: string; url: string }
+type ArtifactGenState = 'idle' | 'generating' | 'done' | 'error'
+
 export default function GapsAnalysis({ onToast }: Props) {
   const [sessions,     setSessions]     = useState<Session[]>([])
   const [sessLoading,  setSessLoading]  = useState(true)
@@ -294,6 +297,11 @@ export default function GapsAnalysis({ onToast }: Props) {
   const [thinkOpen,    setThinkOpen]    = useState(false)
   const resultsRef = useRef<HTMLDivElement>(null)
   const abortRef   = useRef<AbortController | null>(null)
+
+  // ── Artifact state ────────────────────────────────────────────
+  const [artifactFiles,    setArtifactFiles]    = useState<ArtifactFile[]>([])
+  const [artifactGenState, setArtifactGenState] = useState<ArtifactGenState>('idle')
+  const [artifactError,    setArtifactError]    = useState<string | null>(null)
 
   // ── Load sessions ─────────────────────────────────────────────
   useEffect(() => {
@@ -312,6 +320,64 @@ export default function GapsAnalysis({ onToast }: Props) {
   const selectedSession  = useLatest
     ? latestSession
     : sessions.find(s => s.id === selId) ?? null
+
+  // ── Fetch existing artifacts when session changes ─────────────
+  useEffect(() => {
+    const id = selectedSession?.id
+    if (!id) { setArtifactFiles([]); return }
+    setArtifactGenState('idle')
+    setArtifactError(null)
+    fetch(`/api/sessions/${id}/artifacts`)
+      .then(r => r.ok ? r.json() as Promise<{ files: ArtifactFile[] }> : Promise.reject(r.status))
+      .then(data => setArtifactFiles(data.files ?? []))
+      .catch(() => setArtifactFiles([]))
+  }, [selectedSession?.id])
+
+  // ── Generate artifacts ────────────────────────────────────────
+  const handleGenerateArtifacts = useCallback(async () => {
+    const id = selectedSession?.id
+    if (!id || artifactGenState === 'generating') return
+    setArtifactGenState('generating')
+    setArtifactError(null)
+    try {
+      const r = await fetch(`/api/sessions/${id}/artifacts`, { method: 'POST' })
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}))
+        throw new Error((err as { detail?: string }).detail ?? `HTTP ${r.status}`)
+      }
+      const reader = r.body!.getReader()
+      const dec = new TextDecoder()
+      let buf = ''
+      let settled = false
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += dec.decode(value, { stream: true })
+        const lines = buf.split('\n')
+        buf = lines.pop() ?? ''
+        for (const line of lines) {
+          if (!line.trim()) continue
+          try {
+            const msg = JSON.parse(line) as { type: string; files?: ArtifactFile[]; message?: string }
+            if (msg.type === 'done') {
+              setArtifactFiles(msg.files ?? [])
+              setArtifactGenState('done')
+              settled = true
+              onToast?.('Artifacts ready', `Session ${id.slice(0, 10)}`)
+            } else if (msg.type === 'error') {
+              setArtifactError(msg.message ?? 'Unknown error')
+              setArtifactGenState('error')
+              settled = true
+            }
+          } catch { /* ignore partial lines */ }
+        }
+      }
+      if (!settled) setArtifactGenState('done')
+    } catch (err) {
+      setArtifactError(err instanceof Error ? err.message : String(err))
+      setArtifactGenState('error')
+    }
+  }, [selectedSession?.id, artifactGenState, onToast])
 
   const segments    = parseSegments(accumulated)
   const thinkText   = segments.filter(s => s.type === 'thinking').map(s => s.text).join('')
@@ -683,6 +749,105 @@ export default function GapsAnalysis({ onToast }: Props) {
             </div>
           )}
         </div>
+
+        {/* ── Session artifacts ── */}
+        {selectedSession && (
+          <div style={{ marginTop: 28 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
+              <span style={{ fontSize: 12.5, fontWeight: 600 }}>Session artifacts</span>
+              <span style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: 10.5, color: 'var(--text-faint)' }}>
+                summary · coverage · study guide · quiz
+              </span>
+            </div>
+
+            {artifactFiles.length > 0 ? (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7 }}>
+                {artifactFiles.map(f => (
+                  <a
+                    key={f.name}
+                    href={f.url}
+                    download={f.name}
+                    style={{
+                      display: 'inline-flex', alignItems: 'center', gap: 5,
+                      padding: '6px 11px',
+                      background: 'var(--accent)', borderRadius: 6,
+                      color: '#fff', fontSize: 12, fontWeight: 600,
+                      textDecoration: 'none',
+                    }}
+                  >
+                    <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M8 2v8m0 0l-3-3m3 3l3-3M2 13h12" />
+                    </svg>
+                    {f.label}
+                  </a>
+                ))}
+                <button
+                  onClick={handleGenerateArtifacts}
+                  disabled={artifactGenState === 'generating'}
+                  style={{
+                    display: 'inline-flex', alignItems: 'center', gap: 5,
+                    padding: '6px 11px',
+                    background: 'transparent',
+                    border: '1px solid rgba(255,255,255,0.15)',
+                    borderRadius: 6,
+                    color: 'var(--text-soft)', fontSize: 12, fontWeight: 500,
+                    cursor: artifactGenState === 'generating' ? 'default' : 'pointer',
+                    fontFamily: 'inherit',
+                    opacity: artifactGenState === 'generating' ? 0.5 : 1,
+                  }}
+                >
+                  {artifactGenState === 'generating' ? 'Regenerating…' : 'Regenerate'}
+                </button>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {artifactGenState === 'error' && artifactError && (
+                  <div style={{
+                    padding: '8px 11px',
+                    background: 'rgba(239,77,86,0.08)',
+                    border: '1px solid rgba(239,77,86,0.22)',
+                    borderRadius: 7, fontSize: 12, color: 'var(--rec-text)',
+                  }}>
+                    {artifactError}
+                  </div>
+                )}
+                <button
+                  onClick={handleGenerateArtifacts}
+                  disabled={artifactGenState === 'generating'}
+                  style={{
+                    display: 'inline-flex', alignItems: 'center', gap: 6,
+                    height: 34, padding: '0 14px',
+                    background: artifactGenState === 'generating' ? 'rgba(94,106,210,0.15)' : 'rgba(94,106,210,0.18)',
+                    border: '1px solid rgba(94,106,210,0.30)',
+                    borderRadius: 8,
+                    color: artifactGenState === 'generating' ? 'var(--text-faint)' : 'var(--accent)',
+                    fontSize: 12.5, fontWeight: 600,
+                    cursor: artifactGenState === 'generating' ? 'default' : 'pointer',
+                    fontFamily: 'inherit',
+                  }}
+                >
+                  {artifactGenState === 'generating' ? (
+                    <>
+                      <span className="animate-spin-slow" style={{ display: 'inline-flex' }}>
+                        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6">
+                          <circle cx="8" cy="8" r="5.5" strokeDasharray="25" strokeDashoffset="10" />
+                        </svg>
+                      </span>
+                      Generating…
+                    </>
+                  ) : (
+                    <>
+                      <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M8 2v10M5 9l3 3 3-3" />
+                      </svg>
+                      Generate artifacts
+                    </>
+                  )}
+                </button>
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   )
