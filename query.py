@@ -62,6 +62,13 @@ SYSTEM_PROMPT_WITH_LITERATURE = (
 # Shared query reformulation (works for all three literature sources)
 # ---------------------------------------------------------------------------
 
+_REFORMULATE_SYSTEM = (
+    "You output only a search query string. No explanation, no reasoning, no preamble, "
+    "no step-by-step thinking, no quotes, no markdown. Respond with the query and nothing else."
+)
+_MAX_REFORMULATED_QUERY_CHARS = 150
+
+
 def reformulate_for_search(
     user_question: str,
     conversation_history: str,
@@ -90,12 +97,33 @@ def reformulate_for_search(
         t0 = time.time()
         response = ollama.chat(
             model=REFORMULATE_MODEL,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": _REFORMULATE_SYSTEM},
+                {"role": "user", "content": prompt},
+            ],
             think=False,
             keep_alive="30m",
+            # A search query is a handful of words. Capping generation length bounds
+            # the worst case if the model ignores think=False and starts narrating
+            # a chain-of-thought instead — without this it can ramble for 30-60s.
+            options={"num_predict": 80},
         )
         print(f"[Literature] llm {time.time() - t0:.1f}s", flush=True)
         raw = _THINK_RE.sub("", response["message"]["content"]).strip().strip("\"'")
+
+        # Some qwen3/Ollama combinations ignore think=False and return a rambling
+        # reasoning paragraph as plain content instead of a short query — e.g.
+        # "We are given a researcher's question: ... Let's break this into
+        # concepts ...". Forwarding that as a query 414s against PubMed/Semantic
+        # Scholar/OpenAlex (it becomes a multi-KB URL parameter). A real query is
+        # one short line, so anything longer or multi-line is treated the same as
+        # a failed reformulation (search_literature already skips gracefully).
+        if not raw or len(raw) > _MAX_REFORMULATED_QUERY_CHARS or len(raw.splitlines()) > 1:
+            logger.warning(
+                "Search reformulator returned unusable result (%d chars, %d lines): %r",
+                len(raw), len(raw.splitlines()), raw[:120],
+            )
+            return None
         if len(raw) < 5:
             logger.warning("Search reformulator returned too-short result: %r", raw)
             return None
@@ -184,9 +212,14 @@ def search_literature(
         on_status("reformulating")
     query = reformulate_for_search(question, conversation_history, selected_doc_titles or [])
     if not query:
-        print("[Literature] reformulation failed — skipping all sources", flush=True)
-        return []
-    print(f"[Literature] reformulated query: {query!r}", flush=True)
+        # Fall back to the raw question rather than skipping literature entirely —
+        # reformulation can legitimately fail (e.g. the reformulator model rambles
+        # instead of returning a short query); the literature APIs still accept a
+        # plain-language query reasonably well.
+        print("[Literature] reformulation failed — searching with raw question instead", flush=True)
+        query = question
+    else:
+        print(f"[Literature] reformulated query: {query!r}", flush=True)
     if on_status:
         on_status("searching_literature")
 
