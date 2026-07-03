@@ -360,6 +360,7 @@ export default function Chat() {
 
   const threadRef   = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const abortRef    = useRef<AbortController | null>(null)
 
   // Load modules + documents for the filter popover
   useEffect(() => {
@@ -421,6 +422,10 @@ export default function Chat() {
       { id: amid, role: 'assistant', kind: 'thinking', text: '', time: t, mode },
     ])
 
+    const ctrl = new AbortController()
+    abortRef.current = ctrl
+    let text = ''
+
     try {
       const resp = await fetch('/api/chat', {
         method: 'POST',
@@ -432,6 +437,7 @@ export default function Chat() {
           history,
           mode,
         }),
+        signal: ctrl.signal,
       })
 
       if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`)
@@ -439,7 +445,6 @@ export default function Chat() {
       const reader  = resp.body.getReader()
       const decoder = new TextDecoder()
       let buf       = ''
-      let text      = ''
       let transitioned = false
 
       while (true) {
@@ -508,16 +513,28 @@ export default function Chat() {
         }
       }
     } catch (err) {
-      setMessages(prev => prev.map(m =>
-        m.id === amid
-          ? { ...m, kind: 'error', text: `Request failed: ${err instanceof Error ? err.message : String(err)}` }
-          : m
-      ))
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        // User hit Stop — finalize with whatever text streamed in, no error styling.
+        setMessages(prev => prev.map(m =>
+          m.id === amid ? { ...m, kind: 'answer', text: text || m.text } : m
+        ))
+      } else {
+        setMessages(prev => prev.map(m =>
+          m.id === amid
+            ? { ...m, kind: 'error', text: `Request failed: ${err instanceof Error ? err.message : String(err)}` }
+            : m
+        ))
+      }
     } finally {
+      abortRef.current = null
       setStreaming(false)
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chatInput, streaming, selected, lit, messages, mode])
+
+  const stop = useCallback(() => {
+    abortRef.current?.abort()
+  }, [])
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() }
@@ -628,11 +645,16 @@ export default function Chat() {
                 overflow: chatInput.split('\n').length > 3 ? 'auto' : 'hidden',
               }}
             />
-            <SendButton
-              onClick={send}
-              disabled={!chatInput.trim() || streaming}
-              collaborate={mode === 'collaborate'}
-            />
+            {streaming
+              ? <StopButton onClick={stop} />
+              : (
+                <SendButton
+                  onClick={send}
+                  disabled={!chatInput.trim() || streaming}
+                  collaborate={mode === 'collaborate'}
+                />
+              )
+            }
           </div>
 
           <div style={{
@@ -653,6 +675,31 @@ export default function Chat() {
 }
 
 // ── Small sub-components ──────────────────────────────────────────
+
+function StopButton({ onClick }: { onClick: () => void }) {
+  const [hov, setHov] = useState(false)
+  return (
+    <button
+      onClick={onClick}
+      onMouseEnter={() => setHov(true)}
+      onMouseLeave={() => setHov(false)}
+      title="Stop generating"
+      style={{
+        width: 34, height: 34, flexShrink: 0,
+        borderRadius: 8, border: 'none',
+        cursor: 'pointer',
+        background: hov ? 'rgba(239,77,86,0.22)' : 'rgba(239,77,86,0.14)',
+        color: 'var(--rec-text)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        transition: 'background 140ms ease',
+      }}
+    >
+      <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
+        <rect x="3" y="3" width="10" height="10" rx="2" />
+      </svg>
+    </button>
+  )
+}
 
 function SendButton({ onClick, disabled, collaborate }: { onClick: () => void; disabled: boolean; collaborate?: boolean }) {
   const [hov, setHov] = useState(false)

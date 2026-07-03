@@ -249,15 +249,22 @@ async def chat(body: ChatRequest):
       {"type":"token","text":"..."}   — one per answer token
       {"type":"done","source_details":[...],"literature":[...]}   — final metadata
       {"type":"error","message":"..."}   — on ValueError or unexpected failure
+
+    If the client disconnects (Stop button aborts the fetch), generate() gets
+    cancelled while awaiting the queue; that sets cancel_event, which the token
+    loop below checks so it can close the ollama.chat generator and stop the
+    GPU from generating an answer nobody's listening to.
     """
     loop  = asyncio.get_event_loop()
     queue: asyncio.Queue[str | None] = asyncio.Queue()
+    cancel_event = threading.Event()
 
     def emit(obj: dict) -> None:
         loop.call_soon_threadsafe(queue.put_nowait, json.dumps(obj) + "\n")
 
     def blocking_work() -> None:
         composing_sent = False
+        stream = None
         try:
             # Expand mixed module IDs + filenames → flat filename list
             doc_ids = expand_selection(body.selected) if body.selected else []
@@ -309,6 +316,9 @@ async def chat(body: ChatRequest):
                 )
 
             for chunk in stream:
+                if cancel_event.is_set():
+                    print("[CHAT] cancelled by client — stopping generation", flush=True)
+                    break
                 if isinstance(chunk, dict):
                     if "reasoning" in chunk:
                         line = json.dumps({"type": "reasoning", "text": chunk["reasoning"]}) + "\n"
@@ -344,19 +354,28 @@ async def chat(body: ChatRequest):
                 json.dumps({"type": "error", "message": f"Internal error: {exc}"}) + "\n",
             )
         finally:
+            if stream is not None:
+                try:
+                    stream.close()  # no-op if already exhausted; stops ollama.chat if cancelled mid-stream
+                except Exception:
+                    pass
             loop.call_soon_threadsafe(queue.put_nowait, None)  # sentinel
 
     async def generate():
         future = loop.run_in_executor(_THREAD_POOL, blocking_work)
-        while True:
-            item = await queue.get()
-            if item is None:
-                try:
-                    await future
-                except Exception:
-                    pass  # exceptions already turned into error JSON above
-                return
-            yield item
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    try:
+                        await future
+                    except Exception:
+                        pass  # exceptions already turned into error JSON above
+                    return
+                yield item
+        except asyncio.CancelledError:
+            cancel_event.set()
+            raise
 
     return StreamingResponse(generate(), media_type="application/x-ndjson")
 
