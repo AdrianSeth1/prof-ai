@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react'
 import SourceFilter from '../components/SourceFilter'
 import type { SourceData } from '../components/SourceFilter'
 import ThinkBlock from '../components/ThinkBlock'
+import Markdown from '../components/Markdown'
 
 // ── Local types ───────────────────────────────────────────────────
 
@@ -244,9 +245,7 @@ function MsgRow({ msg, onToggleReasoning }: { msg: ChatMsg; onToggleReasoning: (
 
         {(msg.kind === 'streaming' || msg.kind === 'answer') && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 13 }}>
-            <div style={{ fontSize: 14, color: 'var(--text-body)', lineHeight: 1.68, whiteSpace: 'pre-wrap' }}>
-              {msg.text}
-            </div>
+            <Markdown text={msg.text} />
             {/* Only show citation chips in research mode — collaborate sends none */}
             {msg.kind === 'answer' && msgMode === 'research' && msg.chips && msg.chips.length > 0 && (
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, alignItems: 'center' }}>

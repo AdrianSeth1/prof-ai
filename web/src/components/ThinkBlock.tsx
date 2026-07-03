@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react'
+import Markdown from './Markdown'
 
 // Collapsible, auto-scrolling reasoning-trace block. Shared by GapsAnalysis and Chat.
 export default function ThinkBlock({
@@ -55,18 +56,16 @@ export default function ThinkBlock({
           ref={bodyRef}
           style={{
             padding: '2px 14px 12px',
-            fontFamily: '"JetBrains Mono", monospace',
-            fontSize: 11.5,
-            color: 'var(--text-ghost)',
-            lineHeight: 1.75,
             borderTop: '1px solid rgba(255,255,255,0.05)',
-            whiteSpace: 'pre-wrap',
             wordBreak: 'break-word',
             maxHeight: 280,
             overflowY: 'auto',
           }}
         >
-          {text || '…'}
+          <Markdown
+            text={text || '…'}
+            style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: 11.5, color: 'var(--text-ghost)', lineHeight: 1.75 }}
+          />
         </div>
       )}
     </div>
