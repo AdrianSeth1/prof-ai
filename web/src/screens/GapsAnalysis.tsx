@@ -345,7 +345,8 @@ export default function GapsAnalysis({ onToast }: Props) {
         const err = await r.json().catch(() => ({}))
         throw new Error((err as { detail?: string }).detail ?? `HTTP ${r.status}`)
       }
-      const reader = r.body!.getReader()
+      if (!r.body) throw new Error('No response body')
+      const reader = r.body.getReader()
       const dec = new TextDecoder()
       let buf = ''
       let settled = false

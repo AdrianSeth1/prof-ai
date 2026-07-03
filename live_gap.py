@@ -154,7 +154,7 @@ class LiveGapWorker:
             delta = delta[-MAX_TRANSCRIPT_CHARS:]
         self._last_segment_count = len(session.segments)
 
-        full_tx = " ".join(seg["text"] for seg in session.segments)
+        full_tx = " ".join(seg.get("text", "") for seg in session.segments)
         result = ""
         t0 = time.time()
         try:

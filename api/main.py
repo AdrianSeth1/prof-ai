@@ -787,7 +787,7 @@ async def run_gaps(body: _GapsRequest):
 
             try:
                 tx_for_guard = load_transcript(session_id)
-            except SystemExit:
+            except (Exception, SystemExit):
                 tx_for_guard = ""
             findings = parse_gap_findings(content_buf, transcript=tx_for_guard)
             enqueue({
@@ -881,7 +881,9 @@ async def get_artifact_list(session_id: str):
 async def download_artifact(session_id: str, filename: str):
     """Download a specific artifact file."""
     from fastapi.responses import FileResponse
-    # Sanitise: reject any path traversal
+    # Sanitise: reject path traversal in both parameters
+    if ".." in session_id or "/" in session_id or "\\" in session_id or session_id.startswith("."):
+        raise HTTPException(status_code=400, detail="Invalid session_id")
     if "/" in filename or "\\" in filename or filename.startswith("."):
         raise HTTPException(status_code=400, detail="Invalid filename")
     path = Path("exports") / session_id / filename

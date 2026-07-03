@@ -46,10 +46,10 @@ def _guard_coverage(findings: list[dict], transcript: str) -> list[dict]:
         f = dict(item)
         status = f.get("status", "uncovered")
         # Strip surrounding quotes the model sometimes adds around the quote
-        evidence = (f.get("evidence") or "").strip().strip('"').strip("'").strip()
+        evidence = (f.get("evidence") or "").strip().strip("\"'").strip()
         if status in ("covered", "partial"):
             ev_norm = _normalise(evidence)
-            if len(ev_norm) < 8 or ev_norm not in tx_norm:
+            if len(ev_norm) < 20 or ev_norm not in tx_norm:
                 print(
                     f"[GAP-GUARD] '{f.get('topic', '?')}' {status}→uncovered "
                     f"({'empty evidence' if not ev_norm else repr(ev_norm[:60])})",
@@ -59,6 +59,9 @@ def _guard_coverage(findings: list[dict], transcript: str) -> list[dict]:
                 f["evidence"] = ""
             else:
                 f["evidence"] = evidence
+        else:
+            # Clear evidence the LLM may incorrectly supply for uncovered items
+            f["evidence"] = ""
         guarded.append(f)
     return guarded
 

@@ -30,6 +30,7 @@ interface ChatMsg {
   text: string
   time: string
   chips?: Chip[]
+  mode: ChatMode
 }
 
 interface HistoryEntry { role: 'user' | 'assistant'; content: string }
@@ -126,8 +127,9 @@ function ShimmerLine({ w }: { w: string }) {
 
 // ── Message row ───────────────────────────────────────────────────
 
-function MsgRow({ msg, mode }: { msg: ChatMsg; mode: ChatMode }) {
+function MsgRow({ msg }: { msg: ChatMsg }) {
   const isUser = msg.role === 'user'
+  const msgMode = msg.mode
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
       {/* Header */}
@@ -143,7 +145,7 @@ function MsgRow({ msg, mode }: { msg: ChatMsg; mode: ChatMode }) {
           ) : (
             <div style={{
               width: 22, height: 22, borderRadius: 6,
-              background: mode === 'collaborate'
+              background: msgMode === 'collaborate'
                 ? 'linear-gradient(150deg,#e9a23b,#c47d10)'
                 : 'linear-gradient(150deg,#6e79e0,#5059bd)',
               flexShrink: 0,
@@ -152,7 +154,7 @@ function MsgRow({ msg, mode }: { msg: ChatMsg; mode: ChatMode }) {
           )
         }
         <span style={{ fontSize: 12.5, fontWeight: 600 }}>
-          {isUser ? 'You' : mode === 'collaborate' ? 'Collaborator' : 'Prof AI'}
+          {isUser ? 'You' : msgMode === 'collaborate' ? 'Collaborator' : 'Prof AI'}
         </span>
         <span style={{ fontFamily: '"JetBrains Mono",monospace', fontSize: 10.5, color: 'var(--text-faint)' }}>
           {msg.time}
@@ -179,7 +181,7 @@ function MsgRow({ msg, mode }: { msg: ChatMsg; mode: ChatMode }) {
               {msg.text}
             </div>
             {/* Only show citation chips in research mode — collaborate sends none */}
-            {msg.kind === 'answer' && mode === 'research' && msg.chips && msg.chips.length > 0 && (
+            {msg.kind === 'answer' && msgMode === 'research' && msg.chips && msg.chips.length > 0 && (
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, alignItems: 'center' }}>
                 {msg.chips.map((c, i) => <CitationChip key={i} chip={c} />)}
               </div>
@@ -342,8 +344,8 @@ export default function Chat() {
     const amid = uid()
     setMessages(prev => [
       ...prev,
-      { id: umid, role: 'user',      kind: 'user',     text: q, time: t },
-      { id: amid, role: 'assistant', kind: 'thinking', text: '', time: t },
+      { id: umid, role: 'user',      kind: 'user',     text: q, time: t, mode },
+      { id: amid, role: 'assistant', kind: 'thinking', text: '', time: t, mode },
     ])
 
     try {
@@ -494,7 +496,7 @@ export default function Chat() {
               padding: '26px 24px 8px',
               display: 'flex', flexDirection: 'column', gap: 26,
             }}>
-              {messages.map(m => <MsgRow key={m.id} msg={m} mode={mode} />)}
+              {messages.map(m => <MsgRow key={m.id} msg={m} />)}
             </div>
           )
         }
