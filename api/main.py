@@ -243,6 +243,7 @@ def _format_history(history: list[HistoryEntry]) -> str:
 async def chat(body: ChatRequest):
     """
     Stream an LLM answer as NDJSON lines:
+      {"type":"status","step":"..."}   — pipeline progress (reformulating/searching_literature/retrieving/composing)
       {"type":"reasoning","text":"..."}   — one per reasoning-trace token (qwen3 thinking)
       {"type":"token","text":"..."}   — one per answer token
       {"type":"done","source_details":[...],"literature":[...]}   — final metadata
@@ -251,11 +252,18 @@ async def chat(body: ChatRequest):
     loop  = asyncio.get_event_loop()
     queue: asyncio.Queue[str | None] = asyncio.Queue()
 
+    def emit(obj: dict) -> None:
+        loop.call_soon_threadsafe(queue.put_nowait, json.dumps(obj) + "\n")
+
     def blocking_work() -> None:
+        composing_sent = False
         try:
             # Expand mixed module IDs + filenames → flat filename list
             doc_ids = expand_selection(body.selected) if body.selected else []
             conv_history = _format_history(body.history)
+
+            def on_status(step: str) -> None:
+                emit({"type": "status", "step": step})
 
             if body.mode == "collaborate":
                 print(
@@ -268,6 +276,7 @@ async def chat(body: ChatRequest):
                     doc_ids=doc_ids or None,
                     conversation_history=conv_history,
                     stream_thinking=True,
+                    on_status=on_status,
                 )
             else:
                 # research mode (default) — literature search + grounded RAG
@@ -279,6 +288,7 @@ async def chat(body: ChatRequest):
                         conversation_history=conv_history,
                         selected_doc_titles=doc_ids,
                         max_results=5,
+                        on_status=on_status,
                     )
                 print(
                     f"[CHAT] doc_ids={len(doc_ids) if doc_ids else 'all'}  "
@@ -292,6 +302,7 @@ async def chat(body: ChatRequest):
                     literature_results=lit_results or None,
                     conversation_history=conv_history,
                     stream_thinking=True,
+                    on_status=on_status,
                 )
 
             for chunk in stream:
@@ -301,10 +312,16 @@ async def chat(body: ChatRequest):
                     elif "content" in chunk:
                         if not chunk["content"]:
                             continue
+                        if not composing_sent:
+                            composing_sent = True
+                            emit({"type": "status", "step": "composing"})
                         line = json.dumps({"type": "token", "text": chunk["content"]}) + "\n"
                     else:
                         line = json.dumps({"type": "done", **chunk}) + "\n"
                 elif chunk:                        # skip empty strings
+                    if not composing_sent:
+                        composing_sent = True
+                        emit({"type": "status", "step": "composing"})
                     line = json.dumps({"type": "token", "text": chunk}) + "\n"
                 else:
                     continue

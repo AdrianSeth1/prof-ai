@@ -13,7 +13,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 import chromadb
 import ollama
@@ -165,20 +165,30 @@ def search_literature(
     conversation_history: str = "",
     selected_doc_titles: list[str] | None = None,
     max_results: int = 5,
+    on_status: Callable[[str], None] | None = None,
 ) -> list[dict]:
     """Search selected literature sources in parallel and return deduplicated results.
 
     sources: any subset of ["pubmed", "semantic_scholar", "openalex"].
     Returns [] when sources is empty or all searches fail.
+
+    on_status, if given, is called with "reformulating" before the query-reformulation
+    LLM call and "searching_literature" once reformulation succeeds and the parallel
+    per-source fetch is about to start. Callers that don't need pipeline progress
+    (e.g. app.py) can omit it — default None means no calls, no behavior change.
     """
     if not sources:
         return []
 
+    if on_status:
+        on_status("reformulating")
     query = reformulate_for_search(question, conversation_history, selected_doc_titles or [])
     if not query:
         print("[Literature] reformulation failed — skipping all sources", flush=True)
         return []
     print(f"[Literature] reformulated query: {query!r}", flush=True)
+    if on_status:
+        on_status("searching_literature")
 
     def _search_one(source: str) -> list[dict]:
         try:
@@ -347,6 +357,7 @@ def query_stream(
     literature_results: list[dict] | None = None,
     conversation_history: str = "",
     stream_thinking: bool = False,
+    on_status: Callable[[str], None] | None = None,
 ) -> Iterator[str | dict]:
     """Yield LLM response tokens, then finally yield {"sources": [...], "pubmed": [...]}.
 
@@ -369,6 +380,8 @@ def query_stream(
     if collection.count() == 0:
         raise ValueError("Collection is empty. Run ingest.py first.")
 
+    if on_status:
+        on_status("retrieving")
     query_kwargs: dict = {
         "query_embeddings": [embed(question)],
         "n_results": min(TOP_K, collection.count()),
@@ -427,6 +440,7 @@ def collaborate_stream(
     doc_ids: list[str] | None = None,
     conversation_history: str = "",
     stream_thinking: bool = False,
+    on_status: Callable[[str], None] | None = None,
 ) -> Iterator[str | dict]:
     """Yield LLM tokens for Collaborate mode, then yield {"sources": [...], "literature": []}.
 
@@ -445,6 +459,8 @@ def collaborate_stream(
     if collection.count() == 0:
         raise ValueError("Collection is empty. Run ingest.py first.")
 
+    if on_status:
+        on_status("retrieving")
     results = collection.query(
         query_embeddings=[embed(question)],
         n_results=min(TOP_K, collection.count()),

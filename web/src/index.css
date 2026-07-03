@@ -147,6 +147,7 @@ textarea::placeholder { color: var(--text-faint); }
 .animate-blink      { animation: blink 1s step-end infinite; }
 .animate-pulse-rec  { animation: pulseRec 1.6s infinite; }
 .animate-pulse-proc { animation: pulseRec 1.2s infinite; }
+.animate-pulse-accent { animation: pulseAccent 1.6s infinite; }
 .animate-fade-up    { animation: fadeUp 0.14s ease; }
 .animate-toast-in   { animation: toastIn 0.18s ease; }
 .animate-spin-slow  { animation: spin 0.7s linear infinite; }

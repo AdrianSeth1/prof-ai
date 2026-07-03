@@ -34,6 +34,14 @@ interface ChatMsg {
   mode: ChatMode
   reasoning?: string
   reasoningOpen?: boolean
+  statusLog?: string[]
+}
+
+const STATUS_LABELS: Record<string, string> = {
+  reformulating: 'Reformulating search query',
+  searching_literature: 'Searching literature',
+  retrieving: 'Retrieving course materials',
+  composing: 'Composing answer',
 }
 
 interface HistoryEntry { role: 'user' | 'assistant'; content: string }
@@ -128,6 +136,36 @@ function ShimmerLine({ w }: { w: string }) {
   )
 }
 
+// ── Pipeline status stepper ────────────────────────────────────────
+
+function StatusStepper({ steps }: { steps: string[] }) {
+  if (steps.length === 0) return null
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+      {steps.map((s, i) => {
+        const active = i === steps.length - 1
+        return (
+          <div key={`${s}-${i}`} style={{
+            display: 'flex', alignItems: 'center', gap: 8,
+            fontFamily: '"JetBrains Mono",monospace', fontSize: 11,
+          }}>
+            <span
+              className={active ? 'animate-pulse-accent' : undefined}
+              style={{
+                width: 6, height: 6, borderRadius: '50%', flexShrink: 0,
+                background: active ? 'var(--accent)' : 'var(--text-ghost)',
+              }}
+            />
+            <span style={{ color: active ? 'var(--text-soft)' : 'var(--text-faint)' }}>
+              {STATUS_LABELS[s] ?? s}
+            </span>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 // ── Message row ───────────────────────────────────────────────────
 
 function MsgRow({ msg, onToggleReasoning }: { msg: ChatMsg; onToggleReasoning: (id: string) => void }) {
@@ -181,11 +219,15 @@ function MsgRow({ msg, onToggleReasoning }: { msg: ChatMsg; onToggleReasoning: (
         )}
 
         {msg.kind === 'thinking' && !hasReasoning && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            <ShimmerLine w="92%" />
-            <ShimmerLine w="78%" />
-            <ShimmerLine w="40%" />
-          </div>
+          msg.statusLog && msg.statusLog.length > 0
+            ? <StatusStepper steps={msg.statusLog} />
+            : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                <ShimmerLine w="92%" />
+                <ShimmerLine w="78%" />
+                <ShimmerLine w="40%" />
+              </div>
+            )
         )}
 
         {(msg.kind === 'streaming' || msg.kind === 'answer') && (
@@ -402,7 +444,13 @@ export default function Chat() {
           let parsed: Record<string, unknown>
           try { parsed = JSON.parse(line) } catch { continue }
 
-          if (parsed.type === 'reasoning') {
+          if (parsed.type === 'status') {
+            const step = (parsed.step as string) ?? ''
+            if (!step) continue
+            setMessages(prev => prev.map(m =>
+              m.id === amid ? { ...m, statusLog: [...(m.statusLog ?? []), step] } : m
+            ))
+          } else if (parsed.type === 'reasoning') {
             const tok = (parsed.text as string) ?? ''
             if (!tok) continue
             setMessages(prev => prev.map(m =>
