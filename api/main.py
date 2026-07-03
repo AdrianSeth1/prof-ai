@@ -244,6 +244,7 @@ async def chat(body: ChatRequest):
     """
     Stream an LLM answer as NDJSON lines:
       {"type":"status","step":"..."}   — pipeline progress (reformulating/searching_literature/retrieving/composing)
+      {"type":"sources_preview","literature":[...]}   — literature results as soon as search_literature returns
       {"type":"reasoning","text":"..."}   — one per reasoning-trace token (qwen3 thinking)
       {"type":"token","text":"..."}   — one per answer token
       {"type":"done","source_details":[...],"literature":[...]}   — final metadata
@@ -290,6 +291,8 @@ async def chat(body: ChatRequest):
                         max_results=5,
                         on_status=on_status,
                     )
+                    if lit_results:
+                        emit({"type": "sources_preview", "literature": lit_results})
                 print(
                     f"[CHAT] doc_ids={len(doc_ids) if doc_ids else 'all'}  "
                     f"lit={len(lit_results)} results  "

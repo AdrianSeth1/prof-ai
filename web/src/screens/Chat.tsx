@@ -205,6 +205,18 @@ function MsgRow({ msg, onToggleReasoning }: { msg: ChatMsg; onToggleReasoning: (
 
       {/* Body */}
       <div style={{ paddingLeft: 30 }}>
+        {/* Literature found early, before the answer composes */}
+        {msg.kind !== 'user' && msg.kind !== 'answer' && msgMode === 'research' && msg.chips && msg.chips.length > 0 && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 12 }}>
+            <span style={{ fontFamily: '"JetBrains Mono",monospace', fontSize: 10.5, color: 'var(--text-faint)' }}>
+              found {msg.chips.length} paper{msg.chips.length !== 1 ? 's' : ''}
+            </span>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, alignItems: 'center' }}>
+              {msg.chips.map((c, i) => <CitationChip key={i} chip={c} />)}
+            </div>
+          </div>
+        )}
+
         {msg.kind === 'user' && (
           <div style={{ fontSize: 14, color: 'var(--text-body)', lineHeight: 1.6 }}>{msg.text}</div>
         )}
@@ -444,7 +456,14 @@ export default function Chat() {
           let parsed: Record<string, unknown>
           try { parsed = JSON.parse(line) } catch { continue }
 
-          if (parsed.type === 'status') {
+          if (parsed.type === 'sources_preview') {
+            const lit_items = (parsed.literature as LitItem[]) ?? []
+            if (lit_items.length === 0) continue
+            const chips = buildChips([], lit_items)
+            setMessages(prev => prev.map(m =>
+              m.id === amid ? { ...m, chips } : m
+            ))
+          } else if (parsed.type === 'status') {
             const step = (parsed.step as string) ?? ''
             if (!step) continue
             setMessages(prev => prev.map(m =>
