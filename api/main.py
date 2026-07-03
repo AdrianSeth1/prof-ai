@@ -243,7 +243,8 @@ def _format_history(history: list[HistoryEntry]) -> str:
 async def chat(body: ChatRequest):
     """
     Stream an LLM answer as NDJSON lines:
-      {"type":"token","text":"..."}   — one per token
+      {"type":"reasoning","text":"..."}   — one per reasoning-trace token (qwen3 thinking)
+      {"type":"token","text":"..."}   — one per answer token
       {"type":"done","source_details":[...],"literature":[...]}   — final metadata
       {"type":"error","message":"..."}   — on ValueError or unexpected failure
     """
@@ -266,6 +267,7 @@ async def chat(body: ChatRequest):
                     body.question,
                     doc_ids=doc_ids or None,
                     conversation_history=conv_history,
+                    stream_thinking=True,
                 )
             else:
                 # research mode (default) — literature search + grounded RAG
@@ -289,11 +291,19 @@ async def chat(body: ChatRequest):
                     doc_ids=doc_ids or None,
                     literature_results=lit_results or None,
                     conversation_history=conv_history,
+                    stream_thinking=True,
                 )
 
             for chunk in stream:
                 if isinstance(chunk, dict):
-                    line = json.dumps({"type": "done", **chunk}) + "\n"
+                    if "reasoning" in chunk:
+                        line = json.dumps({"type": "reasoning", "text": chunk["reasoning"]}) + "\n"
+                    elif "content" in chunk:
+                        if not chunk["content"]:
+                            continue
+                        line = json.dumps({"type": "token", "text": chunk["content"]}) + "\n"
+                    else:
+                        line = json.dumps({"type": "done", **chunk}) + "\n"
                 elif chunk:                        # skip empty strings
                     line = json.dumps({"type": "token", "text": chunk}) + "\n"
                 else:

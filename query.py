@@ -33,6 +33,8 @@ TOP_K = 6
 _SOURCE_TIMEOUT = 8  # seconds: max wall-clock time per literature source before it's abandoned
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
@@ -267,6 +269,64 @@ def build_pubmed_context(articles: list[dict]) -> str:
     return "\n\n".join(blocks)
 
 
+def _stream_reasoning_and_content(messages: list[dict]) -> Iterator[dict]:
+    """Yield {"reasoning": text} / {"content": text} chunks from a think=True chat stream.
+
+    Qwen3's reasoning trace arrives one of two ways depending on Ollama/qwen version:
+    as a separate chunk["message"]["thinking"] field, or inline in content wrapped in
+    <think>...</think>. We check the thinking field first; if a stream never populates
+    it, we fall back to splitting <think> tags out of content (same approach as
+    gaps.py's _think_filter).
+    """
+    saw_thinking_field = False
+    in_think = False
+    buf = ""
+    for chunk in ollama.chat(model=LLM_MODEL, messages=messages, stream=True, think=True, keep_alive="30m"):
+        msg = chunk.get("message", {})
+        thinking = msg.get("thinking")
+        if thinking:
+            saw_thinking_field = True
+            yield {"reasoning": thinking}
+
+        content = msg.get("content") or ""
+        if not content:
+            continue
+        if saw_thinking_field:
+            # This stream uses the dedicated field — content is answer-only.
+            yield {"content": content}
+            continue
+
+        # Fallback: no thinking field seen yet — split <think> tags out of content.
+        buf += content
+        while buf:
+            if not in_think:
+                idx = buf.find(_THINK_OPEN)
+                if idx == -1:
+                    safe = max(0, len(buf) - len(_THINK_OPEN) + 1)
+                    if safe:
+                        yield {"content": buf[:safe]}
+                    buf = buf[safe:]
+                    break
+                if idx:
+                    yield {"content": buf[:idx]}
+                buf = buf[idx + len(_THINK_OPEN):]
+                in_think = True
+            else:
+                idx = buf.find(_THINK_CLOSE)
+                if idx == -1:
+                    safe = max(0, len(buf) - len(_THINK_CLOSE) + 1)
+                    if safe:
+                        yield {"reasoning": buf[:safe]}
+                    buf = buf[safe:]
+                    break
+                if idx:
+                    yield {"reasoning": buf[:idx]}
+                buf = buf[idx + len(_THINK_CLOSE):]
+                in_think = False
+    if buf and not in_think:
+        yield {"content": buf}
+
+
 def _build_where(
     session_id: str | None,
     doc_ids: list[str] | None,
@@ -286,8 +346,16 @@ def query_stream(
     doc_ids: list[str] | None = None,
     literature_results: list[dict] | None = None,
     conversation_history: str = "",
+    stream_thinking: bool = False,
 ) -> Iterator[str | dict]:
     """Yield LLM response tokens, then finally yield {"sources": [...], "pubmed": [...]}.
+
+    When stream_thinking is False (default, matches all existing callers), behavior is
+    unchanged: plain str tokens are yielded, then one terminal dict with "sources" etc.
+
+    When stream_thinking is True, each non-terminal yield is instead a dict shaped
+    {"reasoning": "..."} or {"content": "..."} so a caller can render the model's
+    reasoning trace separately from its answer. The terminal dict is unchanged either way.
 
     Raises ValueError if the collection is unavailable.
     """
@@ -332,8 +400,12 @@ def query_stream(
         {"role": "system", "content": system},
         {"role": "user", "content": f"Context:\n\n{combined_context}{history_section}\n\nQuestion: {question}"},
     ]
-    for chunk in ollama.chat(model=LLM_MODEL, messages=messages, stream=True, keep_alive="30m"):
-        yield chunk["message"]["content"]
+    if stream_thinking:
+        for piece in _stream_reasoning_and_content(messages):
+            yield piece
+    else:
+        for chunk in ollama.chat(model=LLM_MODEL, messages=messages, stream=True, keep_alive="30m"):
+            yield chunk["message"]["content"]
     yield {"sources": sources, "source_details": source_details, "literature": literature_results or []}
 
 
@@ -354,11 +426,13 @@ def collaborate_stream(
     question: str,
     doc_ids: list[str] | None = None,
     conversation_history: str = "",
+    stream_thinking: bool = False,
 ) -> Iterator[str | dict]:
     """Yield LLM tokens for Collaborate mode, then yield {"sources": [...], "literature": []}.
 
     Reuses the same ChromaDB retrieval as query_stream but drives the teaching/ideation
     system prompt instead. No literature search, no citation requirement.
+    See query_stream for the stream_thinking contract (default off, backward-compatible).
     Raises ValueError if the collection is unavailable.
     """
     if not CHROMA_DIR.exists():
@@ -394,8 +468,12 @@ def collaborate_stream(
             ),
         },
     ]
-    for chunk in ollama.chat(model=LLM_MODEL, messages=messages, stream=True, keep_alive="30m"):
-        yield chunk["message"]["content"]
+    if stream_thinking:
+        for piece in _stream_reasoning_and_content(messages):
+            yield piece
+    else:
+        for chunk in ollama.chat(model=LLM_MODEL, messages=messages, stream=True, keep_alive="30m"):
+            yield chunk["message"]["content"]
     yield {"sources": sources, "source_details": source_details, "literature": []}
 
 

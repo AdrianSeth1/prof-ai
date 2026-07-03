@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import SourceFilter from '../components/SourceFilter'
 import type { SourceData } from '../components/SourceFilter'
+import ThinkBlock from '../components/ThinkBlock'
 
 // ── Local types ───────────────────────────────────────────────────
 
@@ -31,6 +32,8 @@ interface ChatMsg {
   time: string
   chips?: Chip[]
   mode: ChatMode
+  reasoning?: string
+  reasoningOpen?: boolean
 }
 
 interface HistoryEntry { role: 'user' | 'assistant'; content: string }
@@ -127,9 +130,10 @@ function ShimmerLine({ w }: { w: string }) {
 
 // ── Message row ───────────────────────────────────────────────────
 
-function MsgRow({ msg }: { msg: ChatMsg }) {
+function MsgRow({ msg, onToggleReasoning }: { msg: ChatMsg; onToggleReasoning: (id: string) => void }) {
   const isUser = msg.role === 'user'
   const msgMode = msg.mode
+  const hasReasoning = !!msg.reasoning && msg.reasoning.trim().length > 0
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
       {/* Header */}
@@ -167,7 +171,16 @@ function MsgRow({ msg }: { msg: ChatMsg }) {
           <div style={{ fontSize: 14, color: 'var(--text-body)', lineHeight: 1.6 }}>{msg.text}</div>
         )}
 
-        {msg.kind === 'thinking' && (
+        {hasReasoning && (
+          <ThinkBlock
+            text={msg.reasoning ?? ''}
+            open={msg.reasoningOpen ?? true}
+            onToggle={() => onToggleReasoning(msg.id)}
+            streaming={msg.kind === 'thinking'}
+          />
+        )}
+
+        {msg.kind === 'thinking' && !hasReasoning && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
             <ShimmerLine w="92%" />
             <ShimmerLine w="78%" />
@@ -325,6 +338,12 @@ export default function Chat() {
     })
   }, [])
 
+  const toggleReasoning = useCallback((id: string) => {
+    setMessages(prev => prev.map(m =>
+      m.id === id ? { ...m, reasoningOpen: !(m.reasoningOpen ?? true) } : m
+    ))
+  }, [])
+
   // ── Send message ────────────────────────────────────────────────
   const send = useCallback(async () => {
     const q = chatInput.trim()
@@ -383,14 +402,21 @@ export default function Chat() {
           let parsed: Record<string, unknown>
           try { parsed = JSON.parse(line) } catch { continue }
 
-          if (parsed.type === 'token') {
+          if (parsed.type === 'reasoning') {
+            const tok = (parsed.text as string) ?? ''
+            if (!tok) continue
+            setMessages(prev => prev.map(m =>
+              m.id === amid ? { ...m, reasoning: (m.reasoning ?? '') + tok, reasoningOpen: true } : m
+            ))
+          } else if (parsed.type === 'token') {
             const tok = (parsed.text as string) ?? ''
             if (!tok) continue
             text += tok
             if (!transitioned) {
               transitioned = true
+              // The answer has started — auto-collapse a reasoning trace, if any.
               setMessages(prev => prev.map(m =>
-                m.id === amid ? { ...m, kind: 'streaming', text: tok } : m
+                m.id === amid ? { ...m, kind: 'streaming', text: tok, reasoningOpen: false } : m
               ))
             } else {
               setMessages(prev => prev.map(m =>
@@ -496,7 +522,7 @@ export default function Chat() {
               padding: '26px 24px 8px',
               display: 'flex', flexDirection: 'column', gap: 26,
             }}>
-              {messages.map(m => <MsgRow key={m.id} msg={m} />)}
+              {messages.map(m => <MsgRow key={m.id} msg={m} onToggleReasoning={toggleReasoning} />)}
             </div>
           )
         }
