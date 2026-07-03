@@ -25,7 +25,7 @@ TRANSCRIPTS_DIR = Path("transcripts") / "sessions"
 SESSIONS_MANIFEST = Path("sessions.json")
 COLLECTION_NAME = "course_material"
 EMBED_MODEL = "nomic-embed-text"
-LLM_MODEL = "qwen3:14b"
+LLM_MODEL = "qwen3:30b-a3b"
 TOP_K = 15
 # Truncate transcript for the query embedding — very long text dilutes topical signal
 EMBED_MAX_WORDS = 1500
@@ -196,7 +196,7 @@ def _think_filter(messages: list[dict], show_thinking: bool) -> Iterator[str]:
     """Generator: yields LLM tokens with <think> blocks suppressed or kept."""
     buf = ""
     in_think = False
-    for chunk in ollama.chat(model=LLM_MODEL, messages=messages, stream=True, think=False):
+    for chunk in ollama.chat(model=LLM_MODEL, messages=messages, stream=True, think=False, keep_alive="30m"):
         buf += chunk["message"]["content"]
         while buf:
             if not in_think:
@@ -244,7 +244,7 @@ def gaps_stream(session_id: str, show_thinking: bool = False) -> Iterator[str]:
         return
 
     query_text = " ".join(transcript.split()[:EMBED_MAX_WORDS])
-    embedding = ollama.embeddings(model=EMBED_MODEL, prompt=query_text)["embedding"]
+    embedding = ollama.embeddings(model=EMBED_MODEL, prompt=query_text, keep_alive="30m")["embedding"]
 
     if not CHROMA_DIR.exists():
         yield "No chroma_db found. Run ingest.py first."

@@ -16,7 +16,7 @@ from gaps import parse_gap_findings
 CHROMA_DIR = Path("chroma_db")
 COLLECTION_NAME = "course_material"
 EMBED_MODEL = "nomic-embed-text"
-LLM_MODEL = "qwen3:14b"
+LLM_MODEL = "qwen3:30b-a3b"
 
 LIVE_GAP_INTERVAL = 60       # seconds between analysis runs
 MIN_WORDS_FOR_GAP = 50       # minimum transcript words before analysing
@@ -27,7 +27,7 @@ MAX_TRANSCRIPT_CHARS = 4000  # cap on transcript delta sent per run
 def _get_chunks(transcript: str, linked_docs: list[str]) -> str:
     query_text = " ".join(transcript.split()[:1500])
     try:
-        embedding = ollama.embeddings(model=EMBED_MODEL, prompt=query_text)["embedding"]
+        embedding = ollama.embeddings(model=EMBED_MODEL, prompt=query_text, keep_alive="30m")["embedding"]
     except Exception:
         return ""
 
@@ -97,7 +97,7 @@ def live_gaps_stream(transcript: str, linked_docs: list[str]) -> Iterator[str]:
         messages=[{"role": "user", "content": prompt}],
         stream=True,
         think=False,
-        keep_alive="10m",
+        keep_alive="30m",
     ):
         yield chunk["message"]["content"]
 

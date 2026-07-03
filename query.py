@@ -28,7 +28,7 @@ SESSIONS_MANIFEST = Path("sessions.json")
 COLLECTION_NAME = "course_material"
 EMBED_MODEL = "nomic-embed-text"
 LLM_MODEL = "qwen3:30b-a3b"
-REFORMULATE_MODEL = "qwen3:14b"
+REFORMULATE_MODEL = "qwen3:30b-a3b"
 TOP_K = 6
 _SOURCE_TIMEOUT = 8  # seconds: max wall-clock time per literature source before it's abandoned
 
@@ -90,6 +90,7 @@ def reformulate_for_search(
             model=REFORMULATE_MODEL,
             messages=[{"role": "user", "content": prompt}],
             think=False,
+            keep_alive="30m",
         )
         print(f"[Literature] llm {time.time() - t0:.1f}s", flush=True)
         raw = _THINK_RE.sub("", response["message"]["content"]).strip().strip("\"'")
@@ -212,7 +213,7 @@ def search_literature(
 
 
 def embed(text: str) -> list[float]:
-    response = ollama.embeddings(model=EMBED_MODEL, prompt=text)
+    response = ollama.embeddings(model=EMBED_MODEL, prompt=text, keep_alive="30m")
     return response["embedding"]
 
 

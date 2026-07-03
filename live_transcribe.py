@@ -32,7 +32,7 @@ from recorder import SAMPLE_RATE, VAD_SILENCE_MS
 from session import LectureSession, Mode
 
 WHISPER_MODEL = "large-v3-turbo"
-VOCAB_MODEL = "qwen3:14b"
+VOCAB_MODEL = "qwen3:30b-a3b"
 MIN_WORDS = 2
 MIN_AVG_LOGPROB = -1.0
 NO_SPEECH_THRESHOLD = 0.7
@@ -116,7 +116,7 @@ def _format_whisper_prompt(concepts: list[str], proper: list[str], max_chars: in
 
 
 def build_whisper_prompt(session: "LectureSession") -> str:
-    """Pull vocabulary from linked doc chunks via qwen3:14b; fall back to DEFAULT_INITIAL_PROMPT."""
+    """Pull vocabulary from linked doc chunks via qwen3:30b-a3b; fall back to DEFAULT_INITIAL_PROMPT."""
     if not session.linked_documents:
         print("[Whisper] no linked documents — using default initial prompt", flush=True)
         return DEFAULT_INITIAL_PROMPT
@@ -154,6 +154,7 @@ def build_whisper_prompt(session: "LectureSession") -> str:
             model=VOCAB_MODEL,
             messages=[{"role": "user", "content": extraction_prompt}],
             think=False,
+            keep_alive="30m",
         )
         raw_vocab = _THINK_RE.sub("", response["message"]["content"]).strip()
         if not raw_vocab:
